@@ -1,0 +1,32 @@
+from django.urls import path
+
+from . import orgs, roles, sso, users, views
+
+urlpatterns = [
+    path("auth/login", views.login),
+    path("auth/register", views.register),
+    path("auth/refresh", views.refresh),
+    path("auth/logout", views.logout),
+    path("auth/switch-org", views.switch_org),
+    path("auth/ws-token", views.ws_token),
+    path("auth/sso/providers", sso.public_providers),
+    path("auth/sso/<str:provider>/init", sso.init_sso),
+    path("auth/sso/<str:provider>/callback", sso.callback_sso),
+    path("settings/sso/<str:provider>", sso.sso_provider_detail),
+    path("settings/sso", sso.sso_settings),
+    path("me/settings", views.me_settings),
+    path("me/password", views.me_password),
+    path("me/availability", views.me_availability),
+    path("me/organizations", views.me_organizations),
+    path("me", views.me),
+    path("users/<uuid:user_id>", users.user_detail),
+    path("users", users.users_collection),
+    path("roles/<uuid:role_id>", roles.role_detail),
+    path("roles", roles.roles_collection),
+    path("permissions", roles.list_permissions),
+    path("organizations/current", orgs.current_organization),
+    path("organizations/members/<uuid:member_id>", orgs.member_detail),
+    path("organizations/members", orgs.members_collection),
+    path("organizations", orgs.organizations_collection),
+    path("org/settings", orgs.org_settings),
+]
