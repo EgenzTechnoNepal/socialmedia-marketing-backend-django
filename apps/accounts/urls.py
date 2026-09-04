@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import orgs, roles, sso, users, views
+from . import api_keys, audit, orgs, roles, sso, users, views
 
 urlpatterns = [
     path("auth/login", views.login),
@@ -29,4 +29,9 @@ urlpatterns = [
     path("organizations/members", orgs.members_collection),
     path("organizations", orgs.organizations_collection),
     path("org/settings", orgs.org_settings),
+    path("org/audio", orgs.org_audio),
+    path("api-keys/<uuid:key_id>", api_keys.api_key_detail),
+    path("api-keys", api_keys.api_keys_collection),
+    path("audit-logs/<uuid:log_id>", audit.audit_log_detail),
+    path("audit-logs", audit.audit_logs_collection),
 ]

@@ -63,8 +63,25 @@ class Template(UUIDModel):
     sample_values = models.JSONField(default=list)
     add_security_recommendation = models.BooleanField(default=False)
     code_expiration_minutes = models.IntegerField(default=0)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        db_constraint=False,
+        related_name="+",
+    )
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        db_constraint=False,
+        related_name="+",
+    )
 
     objects = ActiveManager()
+    all_objects = models.Manager()
 
     class Meta:
         db_table = "templates"

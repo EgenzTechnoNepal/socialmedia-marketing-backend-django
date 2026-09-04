@@ -1,6 +1,7 @@
 import json
 import logging
 import mimetypes
+import re
 import uuid
 from datetime import timedelta
 
@@ -385,79 +386,329 @@ def serve_media(request, message_id):
     return FileResponse(path.open("rb"), filename=msg.media_filename or path.name)
 
 
-@api_view(["GET"])
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated])
+def send_reaction(request, contact_id, message_id):
+    contact = _get_contact(request, contact_id)
+    oid = org_id(request)
+    data = request.data if isinstance(request.data, dict) else {}
+    emoji = data.get("emoji") or ""
+    try:
+        msg = Message.objects.get(id=message_id, contact=contact, organization_id=oid)
+    except Message.DoesNotExist:
+        return error("Message not found", http_status=404)
+    account_name = msg.whatsapp_account or contact.whatsapp_account
+    try:
+        account = resolve_account(oid, account_name, contact)
+    except APIError as exc:
+        return error(str(exc), http_status=exc.status_code)
+    metadata = dict(msg.metadata or {}) if isinstance(msg.metadata, dict) else {}
+    existing = metadata.get("reactions") or []
+    if not isinstance(existing, list):
+        existing = []
+    user_id = str(request.user.id)
+    reactions = []
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        if item.get("from_user") != user_id:
+            reactions.append(item)
+    if emoji:
+        reactions.append({"emoji": emoji, "from_user": user_id})
+    metadata["reactions"] = reactions
+    msg.metadata = metadata
+    msg.save(update_fields=["metadata", "updated_at"])
+    if msg.whatsapp_message_id:
+        try:
+            whatsapp_client.send_reaction(account, contact.phone_number, msg.whatsapp_message_id, emoji)
+        except WhatsAppError:
+            logger.exception("Failed to send WhatsApp reaction")
+    broadcast_org(
+        oid,
+        "reaction_update",
+        {"message_id": str(msg.id), "contact_id": str(contact.id), "reactions": reactions},
+    )
+    return success({"message_id": str(msg.id), "reactions": reactions})
+
+
+def _normalize_template_name(name: str) -> str:
+    name = (name or "").lower().replace(" ", "_").replace("-", "_")
+    return re.sub(r"[^a-z0-9_]", "", name)
+
+
+def _template_payload(t: Template) -> dict:
+    return {
+        "id": str(t.id),
+        "whatsapp_account": t.whatsapp_account,
+        "meta_template_id": t.meta_template_id or "",
+        "name": t.name,
+        "display_name": t.display_name or t.name,
+        "language": t.language,
+        "category": t.category or "",
+        "status": t.status,
+        "header_type": t.header_type or "",
+        "header_content": t.header_content or "",
+        "body_content": t.body_content or "",
+        "footer_content": t.footer_content or "",
+        "buttons": t.buttons or [],
+        "sample_values": t.sample_values or [],
+        "add_security_recommendation": t.add_security_recommendation,
+        "code_expiration_minutes": t.code_expiration_minutes,
+        "quality_rating": t.quality_rating or "",
+        "created_at": iso(t.created_at),
+        "updated_at": iso(t.updated_at),
+    }
+
+
+def _apply_template_fields(t: Template, data: dict, *, creating=False):
+    if creating or "whatsapp_account" in data:
+        t.whatsapp_account = (data.get("whatsapp_account") or t.whatsapp_account or "").strip()
+    if creating or "name" in data:
+        raw_name = data.get("name") or t.name
+        t.name = _normalize_template_name(raw_name)
+        if creating and not t.display_name:
+            t.display_name = data.get("display_name") or raw_name
+    if "display_name" in data and data.get("display_name"):
+        t.display_name = data["display_name"]
+    if creating or "language" in data:
+        t.language = data.get("language") or t.language
+    if creating or "category" in data:
+        t.category = (data.get("category") or t.category or "").upper()
+    if "header_type" in data or creating:
+        t.header_type = (data.get("header_type") or t.header_type or "").upper()
+    for field in ("header_content", "body_content", "footer_content"):
+        if creating or field in data:
+            setattr(t, field, data.get(field) or getattr(t, field) or "")
+    if "buttons" in data or creating:
+        t.buttons = data.get("buttons") or t.buttons or []
+    if "sample_values" in data or creating:
+        t.sample_values = data.get("sample_values") or t.sample_values or []
+    if "add_security_recommendation" in data or creating:
+        t.add_security_recommendation = bool(data.get("add_security_recommendation"))
+    if "code_expiration_minutes" in data or creating:
+        t.code_expiration_minutes = int(data.get("code_expiration_minutes") or 0)
+
+
+@api_view(["GET", "POST"])
 @permission_classes([CookieAuthenticated])
 def templates_collection(request):
     oid = org_id(request)
-    require_perm(request, "templates", "read")
-    page, limit, offset = parse_pagination(request)
-    qs = Template.objects.filter(organization_id=oid)
-    if request.query_params.get("account"):
-        qs = qs.filter(whatsapp_account=request.query_params["account"])
-    if request.query_params.get("status"):
-        qs = qs.filter(status=request.query_params["status"])
-    if request.query_params.get("category"):
-        qs = qs.filter(category=request.query_params["category"])
-    search = (request.query_params.get("search") or "").strip()
-    if search:
-        qs = qs.filter(name__icontains=search)
-    total = qs.count()
-    items = []
-    for t in qs.order_by("name")[offset : offset + limit]:
-        items.append(
-            {
-                "id": str(t.id),
-                "whatsapp_account": t.whatsapp_account,
-                "meta_template_id": t.meta_template_id or "",
-                "name": t.name,
-                "display_name": t.display_name or t.name,
-                "language": t.language,
-                "category": t.category or "",
-                "status": t.status,
-                "header_type": t.header_type or "",
-                "header_content": t.header_content or "",
-                "body_content": t.body_content or "",
-                "footer_content": t.footer_content or "",
-                "buttons": t.buttons or [],
-                "sample_values": t.sample_values or [],
-                "add_security_recommendation": t.add_security_recommendation,
-                "code_expiration_minutes": t.code_expiration_minutes,
-                "quality_rating": t.quality_rating or "",
-                "created_at": iso(t.created_at),
-                "updated_at": iso(t.updated_at),
-            }
-        )
-    return success(list_payload("templates", items, total, page, limit))
+    if request.method == "GET":
+        require_perm(request, "templates", "read")
+        page, limit, offset = parse_pagination(request)
+        qs = Template.objects.filter(organization_id=oid)
+        if request.query_params.get("account"):
+            qs = qs.filter(whatsapp_account=request.query_params["account"])
+        if request.query_params.get("status"):
+            qs = qs.filter(status=request.query_params["status"])
+        if request.query_params.get("category"):
+            qs = qs.filter(category=request.query_params["category"])
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(name__icontains=search)
+        total = qs.count()
+        items = [_template_payload(t) for t in qs.order_by("name")[offset : offset + limit]]
+        return success(list_payload("templates", items, total, page, limit))
+
+    require_perm(request, "templates", "write")
+    data = request.data if isinstance(request.data, dict) else {}
+    name = (data.get("name") or "").strip()
+    language = (data.get("language") or "").strip()
+    category = (data.get("category") or "").strip()
+    account_name = (data.get("whatsapp_account") or "").strip()
+    is_auth = category.upper() == "AUTHENTICATION"
+    if not account_name or not name or not language or not category:
+        return error("whatsapp_account, name, language, and category are required", http_status=400)
+    if not is_auth and not (data.get("body_content") or "").strip():
+        return error("body_content is required", http_status=400)
+    try:
+        resolve_account(oid, account_name)
+    except APIError:
+        return error("WhatsApp account not found", http_status=400)
+    template_name = _normalize_template_name(name)
+    if Template.objects.filter(organization_id=oid, whatsapp_account=account_name, name=template_name).exists():
+        return error("Template with this name already exists", http_status=409)
+    t = Template(organization_id=oid, status="DRAFT", quality_rating="UNKNOWN", created_by=request.user, updated_by=request.user)
+    _apply_template_fields(t, data, creating=True)
+    t.name = template_name
+    t.display_name = data.get("display_name") or name
+    t.save()
+    return success(_template_payload(t), http_status=201)
 
 
-@api_view(["GET"])
+@api_view(["GET", "PUT", "DELETE"])
 @permission_classes([CookieAuthenticated])
 def template_detail(request, template_id):
     oid = org_id(request)
-    require_perm(request, "templates", "read")
     try:
         t = Template.objects.get(id=template_id, organization_id=oid)
     except Template.DoesNotExist:
         return error("Template not found", http_status=404)
+    if request.method == "GET":
+        require_perm(request, "templates", "read")
+        return success(_template_payload(t))
+    if request.method == "DELETE":
+        require_perm(request, "templates", "delete")
+        if t.meta_template_id:
+            try:
+                account = resolve_account(oid, t.whatsapp_account)
+                whatsapp_client.delete_message_template(account, t.name)
+            except Exception:
+                logger.exception("Failed to delete template from Meta")
+        t.deleted_at = dj_tz.now()
+        t.save(update_fields=["deleted_at"])
+        return success({"message": "Template deleted successfully"})
+    require_perm(request, "templates", "write")
+    if t.status == "PENDING":
+        return error("Template is pending approval and cannot be modified", http_status=400)
+    data = request.data if isinstance(request.data, dict) else {}
+    _apply_template_fields(t, data)
+    t.updated_by = request.user
+    t.save()
+    return success(_template_payload(t))
+
+
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated])
+def publish_template(request, template_id):
+    oid = org_id(request)
+    require_perm(request, "templates", "write")
+    try:
+        t = Template.objects.get(id=template_id, organization_id=oid)
+    except Template.DoesNotExist:
+        return error("Template not found", http_status=404)
+    if t.meta_template_id and t.status == "PENDING":
+        return error("Template is pending approval and cannot be modified", http_status=400)
+    if t.header_type in {"IMAGE", "VIDEO", "DOCUMENT"} and not t.header_content:
+        return error(
+            f"Template has {t.header_type} header but no media file has been uploaded. Please upload a sample {t.header_type.lower()} first.",
+            http_status=400,
+        )
+    try:
+        account = resolve_account(oid, t.whatsapp_account)
+        meta_id = whatsapp_client.submit_message_template(account, t)
+    except APIError as exc:
+        return error(str(exc), http_status=exc.status_code)
+    except WhatsAppError as exc:
+        return error(f"Failed to submit template to Meta: {exc}", http_status=502)
+    old_status = t.status
+    t.meta_template_id = meta_id
+    t.status = "PENDING"
+    t.updated_by = request.user
+    t.save(update_fields=["meta_template_id", "status", "updated_by", "updated_at"])
+    message = "Template submitted to Meta for approval"
+    if old_status and t.meta_template_id and old_status != "DRAFT":
+        message = "Template updated and pending re-approval"
     return success(
         {
-            "id": str(t.id),
-            "whatsapp_account": t.whatsapp_account,
-            "name": t.name,
-            "display_name": t.display_name or t.name,
-            "language": t.language,
-            "category": t.category or "",
+            "message": message,
+            "meta_template_id": meta_id,
             "status": t.status,
-            "header_type": t.header_type or "",
-            "header_content": t.header_content or "",
-            "body_content": t.body_content or "",
-            "footer_content": t.footer_content or "",
-            "buttons": t.buttons or [],
-            "sample_values": t.sample_values or [],
-            "created_at": iso(t.created_at),
-            "updated_at": iso(t.updated_at),
+            "template": _template_payload(t),
         }
     )
+
+
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated])
+def sync_templates(request):
+    oid = org_id(request)
+    require_perm(request, "templates", "write")
+    data = request.data if isinstance(request.data, dict) else {}
+    account_name = (request.query_params.get("account") or data.get("whatsapp_account") or "").strip()
+    if not account_name:
+        return error("whatsapp_account is required", http_status=400)
+    try:
+        account = resolve_account(oid, account_name)
+        meta_templates = whatsapp_client.list_message_templates(account)
+    except APIError as exc:
+        return error(str(exc), http_status=exc.status_code)
+    except WhatsAppError as exc:
+        return error("Failed to fetch templates from Meta", http_status=502, extra={"detail": str(exc)})
+    synced = 0
+    for raw in meta_templates:
+        quality = raw.get("quality_rating") or ""
+        score = raw.get("quality_score") or {}
+        if isinstance(score, dict) and score.get("score"):
+            quality = score["score"]
+        header_type = header_content = body = footer = ""
+        buttons = []
+        for comp in raw.get("components") or []:
+            ctype = (comp.get("type") or "").upper()
+            if ctype == "HEADER":
+                header_type = comp.get("format") or ""
+                header_content = comp.get("text") or ""
+            elif ctype == "BODY":
+                body = comp.get("text") or ""
+            elif ctype == "FOOTER":
+                footer = comp.get("text") or ""
+            elif ctype == "BUTTONS":
+                buttons = list(comp.get("buttons") or [])
+        existing = Template.all_objects.filter(
+            organization_id=oid,
+            whatsapp_account=account.name,
+            name=raw.get("name") or "",
+            language=raw.get("language") or "",
+        ).first()
+        if existing:
+            existing.meta_template_id = raw.get("id") or existing.meta_template_id
+            existing.display_name = raw.get("name") or existing.display_name
+            existing.category = raw.get("category") or existing.category
+            existing.status = raw.get("status") or existing.status
+            existing.header_type = header_type
+            existing.header_content = header_content
+            existing.body_content = body
+            existing.footer_content = footer
+            existing.buttons = buttons
+            existing.deleted_at = None
+            if quality:
+                existing.quality_rating = quality
+            existing.save()
+        else:
+            Template.objects.create(
+                organization_id=oid,
+                whatsapp_account=account.name,
+                meta_template_id=raw.get("id") or "",
+                name=raw.get("name") or "",
+                display_name=raw.get("name") or "",
+                language=raw.get("language") or "",
+                category=raw.get("category") or "",
+                status=raw.get("status") or "PENDING",
+                quality_rating=quality or "UNKNOWN",
+                header_type=header_type,
+                header_content=header_content,
+                body_content=body,
+                footer_content=footer,
+                buttons=buttons,
+            )
+        synced += 1
+    return success({"message": f"Synced {synced} templates", "count": synced})
+
+
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def upload_template_media(request):
+    oid = org_id(request)
+    require_perm(request, "templates", "write")
+    account_name = (request.data.get("account") or request.query_params.get("account") or "").strip()
+    if not account_name:
+        return error("account is required", http_status=400)
+    try:
+        account = resolve_account(oid, account_name)
+    except APIError as exc:
+        return error(str(exc), http_status=exc.status_code)
+    upload = request.FILES.get("file")
+    if not upload:
+        return error("No file provided", http_status=400)
+    mime = upload.content_type or mimetypes.guess_type(upload.name or "")[0] or "application/octet-stream"
+    try:
+        handle = whatsapp_client.upload_session_media(account, upload.read(), mime, upload.name or "file")
+    except WhatsAppError as exc:
+        return error(str(exc), http_status=400)
+    if not handle:
+        return error("Failed to upload media", http_status=502)
+    return success({"handle": handle, "mime_type": mime, "filename": upload.name or ""})
 
 
 def _canned_payload(row: CannedResponse) -> dict:
@@ -574,6 +825,40 @@ def save_incoming_message(account: WhatsAppAccount, contact: Contact, wamid: str
     _touch_contact(contact, _preview(content, msg_type or "text"), account.name, inbound=True)
     broadcast_org(account.organization_id, "new_message", message_ws_payload(msg, contact))
     return msg
+
+
+def handle_incoming_reaction(account: WhatsAppAccount, from_phone: str, wamid: str, emoji: str, profile_name: str = ""):
+    if not wamid:
+        return
+    msg = Message.objects.filter(whatsapp_message_id=wamid).first()
+    if msg is None:
+        idx = wamid.find("FQIA")
+        if idx != -1:
+            suffix_start = idx + 8
+            if suffix_start < len(wamid):
+                suffix = wamid[suffix_start:]
+                msg = Message.objects.filter(whatsapp_message_id__contains=suffix).first()
+    if msg is None:
+        logger.warning("Message not found for reaction wamid=%s", wamid)
+        return
+    from apps.contacts.views import get_or_create_contact
+
+    contact, _ = get_or_create_contact(account.organization_id, from_phone, profile_name, account.name)
+    metadata = dict(msg.metadata or {}) if isinstance(msg.metadata, dict) else {}
+    existing = metadata.get("reactions") or []
+    if not isinstance(existing, list):
+        existing = []
+    reactions = [item for item in existing if isinstance(item, dict) and item.get("from_phone") != from_phone]
+    if emoji:
+        reactions.append({"emoji": emoji, "from_phone": from_phone})
+    metadata["reactions"] = reactions
+    msg.metadata = metadata
+    msg.save(update_fields=["metadata", "updated_at"])
+    broadcast_org(
+        account.organization_id,
+        "reaction_update",
+        {"message_id": str(msg.id), "contact_id": str(contact.id), "reactions": reactions},
+    )
 
 
 def apply_status_update(wamid: str, status: str, error_message: str = ""):

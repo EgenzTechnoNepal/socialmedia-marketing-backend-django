@@ -8,7 +8,10 @@ urlpatterns = [
     path("calls/permission-request", hooks.not_ported),
     path("calls/permission/<uuid:contact_id>", hooks.call_permission),
     path("calls/ice-servers", hooks.ice_servers),
+    path("ivr-flows/<path:rest>", hooks.not_ported),
     path("ivr-flows", hooks.not_ported),
+    path("call-logs/<path:rest>", hooks.not_ported),
     path("call-logs", hooks.not_ported),
+    path("call-transfers/<path:rest>", hooks.not_ported),
     path("call-transfers", hooks.not_ported),
 ]

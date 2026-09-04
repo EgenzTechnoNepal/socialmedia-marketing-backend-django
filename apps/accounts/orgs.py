@@ -2,7 +2,8 @@ import re
 import uuid
 
 from django.utils import timezone as dj_tz
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import FormParser, MultiPartParser
 
 from apps.accounts.models import CustomRole, Organization, User, UserOrganization
 from apps.accounts.roles import seed_system_roles
@@ -192,3 +193,32 @@ def member_detail(request, member_id):
         m.role_id = data.get("role_id")
         m.save(update_fields=["role_id", "updated_at"])
     return success(_member_payload(m, m.user))
+
+
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def org_audio(request):
+    oid = org_id(request)
+    require_perm(request, "organizations", "write")
+    audio_type = request.query_params.get("type") or ""
+    if audio_type not in {"hold_music", "ringback"}:
+        return error("Query parameter 'type' must be 'hold_music' or 'ringback'", http_status=400)
+    upload = request.FILES.get("file")
+    if not upload:
+        return error("No file provided", http_status=400)
+    data = upload.read()
+    if len(data) > 5 * 1024 * 1024:
+        return error("File too large. Maximum size is 5MB", http_status=400)
+    from services import storage
+
+    filename = upload.name or f"{audio_type}.ogg"
+    relative = f"audio/{oid}/{audio_type}_{filename}"
+    storage.save_bytes(relative, data)
+    org = Organization.objects.get(id=oid)
+    settings = org.settings or {}
+    field = "hold_music_file" if audio_type == "hold_music" else "ringback_file"
+    settings[field] = relative
+    org.settings = settings
+    org.save(update_fields=["settings", "updated_at"])
+    return success({"filename": relative, "type": audio_type})

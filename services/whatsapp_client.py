@@ -403,3 +403,218 @@ def get_analytics(account, analytics_type: str, start: int, end: int, granularit
         "call_analytics": "call_analytics",
     }.get(analytics_type, analytics_type)
     return {"id": raw.get("id") or account.business_id, key: {"granularity": nested.get("granularity") or gran, "data_points": points}}
+
+
+def get_business_profile(account) -> dict:
+    url = _graph(account, account.phone_id) + "/whatsapp_business_profile?fields=about,address,description,email,profile_picture_url,websites,vertical"
+    raw = _request("GET", url, account.access_token) or {}
+    data = raw.get("data") or []
+    return data[0] if data else raw
+
+
+def update_business_profile(account, payload: dict) -> dict:
+    url = _graph(account, account.phone_id) + "/whatsapp_business_profile"
+    _request("POST", url, account.access_token, payload)
+    return get_business_profile(account)
+
+
+def list_message_templates(account) -> list:
+    url = _graph(account, account.business_id) + "/message_templates?limit=250"
+    raw = _request("GET", url, account.access_token) or {}
+    return list(raw.get("data") or [])
+
+
+def upload_session_media(account, data: bytes, mime_type: str, filename: str) -> str:
+    """App-scoped upload for template header handles."""
+    app_id = account.app_id
+    if not app_id:
+        raise WhatsAppError("app_id is required to upload template media")
+    start = _request(
+        "POST",
+        f"{BASE_URL}/{_version(account)}/{app_id}/uploads?file_length={len(data)}&file_type={urllib.parse.quote(mime_type)}",
+        account.access_token,
+        {},
+    )
+    session_id = start.get("id") or ""
+    if not session_id:
+        raise WhatsAppError("failed to start upload session")
+    req = urllib.request.Request(
+        f"{BASE_URL}/{_version(account)}/{session_id}",
+        data=data,
+        headers={
+            "Authorization": f"OAuth {account.access_token}",
+            "file_offset": "0",
+            "Content-Type": mime_type or "application/octet-stream",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise WhatsAppError(exc.read().decode("utf-8", errors="replace")) from exc
+    return raw.get("h") or ""
+
+
+def subscribe_waba(account) -> None:
+    url = _graph(account, account.business_id) + "/subscribed_apps"
+    _request("POST", url, account.access_token, {})
+
+
+def test_phone(account) -> dict:
+    fields = "display_phone_number,verified_name,code_verification_status,account_mode,quality_rating,messaging_limit_tier,whatsapp_business_manager_messaging_limit"
+    url = _graph(account, account.phone_id) + f"?fields={fields}"
+    return _request("GET", url, account.access_token) or {}
+
+
+def send_reaction(account, phone: str, wamid: str, emoji: str) -> None:
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "reaction",
+        "reaction": {"message_id": wamid, "emoji": emoji or ""},
+    }
+    _request("POST", _messages_url(account), account.access_token, payload)
+
+
+def exchange_code_for_token(code: str, app_id: str, app_secret: str, api_version: str) -> str:
+    qs = urllib.parse.urlencode(
+        {"client_id": app_id, "client_secret": app_secret, "code": code}
+    )
+    url = f"{BASE_URL}/{api_version or 'v21.0'}/oauth/access_token?{qs}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise WhatsAppError(detail or f"token exchange failed ({exc.code})") from exc
+    token = raw.get("access_token") or ""
+    if not token:
+        raise WhatsAppError("no access token in response")
+    return token
+
+
+def debug_token(input_token: str, app_access_token: str) -> dict:
+    url = f"{BASE_URL}/debug_token?input_token={urllib.parse.quote(input_token)}"
+    raw = _request("GET", url, app_access_token) or {}
+    return raw.get("data") or raw
+
+
+def shared_waba(access_token: str) -> list:
+    url = f"{BASE_URL}/me/accounts?fields=id,name,phone_numbers{{id,display_phone_number,verified_name}}"
+    raw = _request("GET", url, access_token) or {}
+    return list(raw.get("data") or [])
+
+
+def waba_phone_numbers(waba_id: str, access_token: str, api_version: str = "v21.0") -> list:
+    url = f"{BASE_URL}/{api_version}/{waba_id}/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating"
+    raw = _request("GET", url, access_token) or {}
+    return list(raw.get("data") or [])
+
+
+def phone_number_info(phone_id: str, access_token: str, api_version: str = "v21.0") -> dict:
+    url = f"{BASE_URL}/{api_version}/{phone_id}?fields=verified_name,display_phone_number,quality_rating,is_on_biz_app,platform_type"
+    return _request("GET", url, access_token) or {}
+
+
+def upload_profile_picture(account, data: bytes, mime_type: str) -> str:
+    handle = upload_session_media(account, data, mime_type or "image/jpeg", "profile.jpg")
+    if not handle:
+        raise WhatsAppError("failed to upload profile picture")
+    update_business_profile(
+        account,
+        {"messaging_product": "whatsapp", "profile_picture_handle": handle},
+    )
+    return handle
+
+
+def delete_message_template(account, name: str) -> None:
+    url = _graph(account, account.business_id) + f"/message_templates?name={urllib.parse.quote(name)}"
+    try:
+        _request("DELETE", url, account.access_token)
+    except WhatsAppError:
+        logger.warning("Failed to delete Meta template %s", name)
+
+
+def submit_message_template(account, template) -> str:
+    header_type = (template.header_type or "").upper()
+    category = (template.category or "").upper()
+    components = []
+    if category == "AUTHENTICATION":
+        body = {"type": "BODY"}
+        if template.add_security_recommendation:
+            body["add_security_recommendation"] = True
+        components.append(body)
+        if template.code_expiration_minutes:
+            components.append(
+                {"type": "FOOTER", "code_expiration_minutes": template.code_expiration_minutes}
+            )
+        buttons = []
+        for btn in template.buttons or []:
+            if not isinstance(btn, dict):
+                continue
+            item = {"type": (btn.get("type") or "OTP").upper(), "otp_type": btn.get("otp_type") or "COPY_CODE"}
+            if btn.get("text"):
+                item["text"] = btn["text"]
+            buttons.append(item)
+        if buttons:
+            components.append({"type": "BUTTONS", "buttons": buttons})
+    else:
+        if header_type and header_type != "NONE":
+            header = {"type": "HEADER", "format": header_type}
+            if header_type == "TEXT":
+                header["text"] = template.header_content or ""
+            elif header_type in {"IMAGE", "VIDEO", "DOCUMENT"} and template.header_content:
+                header["example"] = {"header_handle": [template.header_content]}
+            else:
+                header = None
+            if header:
+                components.append(header)
+        body = {"type": "BODY", "text": template.body_content or ""}
+        if "{{" in (template.body_content or "") and template.sample_values:
+            examples = []
+            for item in template.sample_values:
+                if isinstance(item, dict) and item.get("value"):
+                    examples.append(str(item["value"]))
+                elif isinstance(item, str):
+                    examples.append(item)
+            if examples:
+                body["example"] = {"body_text": [examples]}
+        components.append(body)
+        if template.footer_content:
+            components.append({"type": "FOOTER", "text": template.footer_content})
+        buttons = []
+        for btn in template.buttons or []:
+            if not isinstance(btn, dict) or not btn.get("text"):
+                continue
+            btn_type = (btn.get("type") or "QUICK_REPLY").upper()
+            if btn_type == "URL":
+                buttons.append({"type": "URL", "text": btn["text"], "url": btn.get("url") or ""})
+            elif btn_type == "PHONE_NUMBER":
+                buttons.append(
+                    {"type": "PHONE_NUMBER", "text": btn["text"], "phone_number": btn.get("phone_number") or ""}
+                )
+            else:
+                buttons.append({"type": "QUICK_REPLY", "text": btn["text"]})
+        if buttons:
+            components.append({"type": "BUTTONS", "buttons": buttons})
+
+    if template.meta_template_id:
+        url = f"{BASE_URL}/{_version(account)}/{template.meta_template_id}"
+        _request("POST", url, account.access_token, {"components": components})
+        return template.meta_template_id
+
+    url = _graph(account, account.business_id) + "/message_templates"
+    payload = {
+        "name": template.name,
+        "language": template.language,
+        "category": category,
+        "components": components,
+    }
+    raw = _request("POST", url, account.access_token, payload) or {}
+    meta_id = raw.get("id") or ""
+    if not meta_id:
+        raise WhatsAppError("Meta did not return a template id")
+    return meta_id

@@ -198,6 +198,8 @@ class APIKey(UUIDModel):
     name = models.CharField(max_length=255)
     key_prefix = models.CharField(max_length=16)
     key_hash = models.CharField(max_length=255)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     objects = ActiveManager()
@@ -208,21 +210,46 @@ class APIKey(UUIDModel):
 
     @classmethod
     def match(cls, raw: str):
-        prefix = raw[:16]
+        prefixes = []
+        if raw.startswith("whm_") and len(raw) >= 12:
+            prefixes.append(raw[4:20] if len(raw) >= 20 else raw[4:12])
+            prefixes.append(raw[4:12])
+        else:
+            prefixes.append(raw[:16])
         digest = hashlib.sha256(raw.encode()).hexdigest()
-        try:
-            key = cls.objects.get(key_prefix=prefix, is_active=True)
-        except cls.DoesNotExist:
-            return None
-        # Go stores bcrypt; also accept sha256 for local tests
-        stored = key.key_hash or ""
-        if stored == digest:
-            return key
-        try:
-            import bcrypt
+        seen = set()
+        for prefix in prefixes:
+            if not prefix or prefix in seen:
+                continue
+            seen.add(prefix)
+            for key in cls.objects.filter(key_prefix=prefix, is_active=True):
+                stored = key.key_hash or ""
+                if stored == digest:
+                    return key
+                try:
+                    import bcrypt
 
-            if bcrypt.checkpw(raw.encode(), stored.encode()):
-                return key
-        except Exception:
-            pass
+                    if bcrypt.checkpw(raw.encode(), stored.encode()):
+                        return key
+                except Exception:
+                    pass
         return None
+
+
+class AuditLog(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.DO_NOTHING, db_constraint=False
+    )
+    resource_type = models.CharField(max_length=50)
+    resource_id = models.UUIDField()
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING, db_constraint=False)
+    user_name = models.CharField(max_length=255)
+    action = models.CharField(max_length=20)
+    changes = models.JSONField(default=list)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "audit_logs"
+        managed = False
+

@@ -9,7 +9,7 @@ from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.contacts.views import get_or_create_contact
-from apps.messaging.views import apply_status_update, save_incoming_message
+from apps.messaging.views import apply_status_update, handle_incoming_reaction, save_incoming_message
 from apps.whatsapp.models import WhatsAppAccount
 from services import storage, whatsapp_client
 
@@ -118,6 +118,16 @@ def webhook_receive(request):
                     if not phone:
                         continue
                     profile = contacts.get(phone) or ""
+                    if msg.get("type") == "reaction":
+                        reaction = msg.get("reaction") or {}
+                        handle_incoming_reaction(
+                            account,
+                            phone,
+                            reaction.get("message_id") or "",
+                            reaction.get("emoji") or "",
+                            profile,
+                        )
+                        continue
                     contact, created = get_or_create_contact(account.organization_id, phone, profile, account.name)
                     msg_type, content, media, button_id, flow_response = _extract_content(msg)
                     saved_media = _download_media(account, media, msg_type) if media else None

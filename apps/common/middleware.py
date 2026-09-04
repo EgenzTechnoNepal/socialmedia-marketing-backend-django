@@ -24,6 +24,8 @@ class GoStyleCSRFMiddleware(MiddlewareMixin):
         path = request.path
         if any(path == prefix or path.startswith(prefix) for prefix in CSRF_EXEMPT_PREFIXES):
             return None
+        if request.headers.get("Authorization") or request.headers.get("X-API-Key"):
+            return None
         cookie = request.COOKIES.get(settings.COOKIE_CSRF_NAME)
         header = request.headers.get("X-CSRF-Token")
         if not cookie or not header or cookie != header:
