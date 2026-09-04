@@ -20,6 +20,9 @@ env/
 .env.*
 !.env.example
 
+# Database dumps (may contain production rows)
+backups/
+
 # Django
 *.log
 local_settings.py

@@ -25,7 +25,7 @@ def exception_handler(exc, context):
 
     if isinstance(exc, DatabaseError):
         return error(
-            "Database is not ready. Start Postgres (and Redis), then retry.",
+            "Database tables are missing. From the Django folder run: python manage.py migrate && python manage.py seed_admin",
             http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
             error_type="database",
         )

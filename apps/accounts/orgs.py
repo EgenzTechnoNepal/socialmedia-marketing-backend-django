@@ -1,6 +1,13 @@
+import logging
+import os
 import re
+import subprocess
+import tempfile
 import uuid
+from pathlib import Path
 
+from django.conf import settings as dj_settings
+from django.http import FileResponse
 from django.utils import timezone as dj_tz
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -11,6 +18,9 @@ from apps.billing.entitlements import assert_can_add_seat
 from apps.common.envelope import error, success
 from apps.common.http import is_super, org_id, require_perm, user_iso
 from apps.common.permissions import CookieAuthenticated
+from apps.common.tokens import redis_client
+
+logger = logging.getLogger(__name__)
 
 
 def _slug(name: str) -> str:
@@ -95,6 +105,7 @@ def org_settings(request):
     if request.method == "GET":
         return success(
             {
+                "name": org.name,
                 "mask_phone_numbers": bool(settings.get("mask_phone_numbers")),
                 "timezone": settings.get("timezone") or "UTC",
                 "date_format": settings.get("date_format") or "",
@@ -134,6 +145,7 @@ def org_settings(request):
     if "name" in data and data.get("name"):
         org.name = data["name"]
     org.save()
+    _invalidate_org_calling_cache(oid)
     return success({"message": "Settings updated"})
 
 
@@ -195,30 +207,131 @@ def member_detail(request, member_id):
     return success(_member_payload(m, m.user))
 
 
-@api_view(["POST"])
+@api_view(["GET", "POST"])
 @permission_classes([CookieAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
 def org_audio(request):
     oid = org_id(request)
-    require_perm(request, "organizations", "write")
     audio_type = request.query_params.get("type") or ""
     if audio_type not in {"hold_music", "ringback"}:
         return error("Query parameter 'type' must be 'hold_music' or 'ringback'", http_status=400)
+    if request.method == "GET":
+        return _serve_org_audio(oid, audio_type)
+    require_perm(request, "organizations", "write")
     upload = request.FILES.get("file")
     if not upload:
         return error("No file provided", http_status=400)
     data = upload.read()
     if len(data) > 5 * 1024 * 1024:
         return error("File too large. Maximum size is 5MB", http_status=400)
-    from services import storage
 
-    filename = upload.name or f"{audio_type}.ogg"
-    relative = f"audio/{oid}/{audio_type}_{filename}"
-    storage.save_bytes(relative, data)
+    filename = f"org_{oid}_{audio_type}.ogg"
+    dest = _calling_audio_dir() / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _transcode_to_opus(data, dest)
+
     org = Organization.objects.get(id=oid)
-    settings = org.settings or {}
+    org_settings = org.settings or {}
     field = "hold_music_file" if audio_type == "hold_music" else "ringback_file"
-    settings[field] = relative
-    org.settings = settings
+    org_settings[field] = filename
+    org.settings = org_settings
     org.save(update_fields=["settings", "updated_at"])
-    return success({"filename": relative, "type": audio_type})
+    _invalidate_org_calling_cache(oid)
+    return success({"filename": filename, "type": audio_type})
+
+
+def _calling_audio_dir() -> Path:
+    return Path(dj_settings.CALLING_AUDIO_DIR)
+
+
+def _invalidate_org_calling_cache(oid) -> None:
+    try:
+        redis_client().delete(f"org:calling_settings:{oid}")
+    except Exception:
+        logger.exception("Failed to invalidate org calling settings cache")
+
+
+def _transcode_to_opus(data: bytes, dest: Path) -> None:
+    """Match Go transcodeToOpus (libopus 48kHz mono). Fall back to the raw bytes if ffmpeg is missing."""
+    fd, tmp_path = tempfile.mkstemp(prefix="org-audio-")
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        fd = -1
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                tmp_path,
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "48k",
+                "-application",
+                "audio",
+                "-frame_duration",
+                "20",
+                "-vn",
+                str(dest),
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0 and dest.is_file():
+            return
+        logger.warning("ffmpeg transcode failed; storing original bytes: %s", result.stderr[-500:] if result.stderr else "")
+        dest.write_bytes(data)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ffmpeg unavailable for org audio (%s); storing original bytes", exc)
+        dest.write_bytes(data)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _serve_org_audio(oid, audio_type: str):
+    try:
+        org = Organization.objects.get(id=oid)
+    except Organization.DoesNotExist:
+        return error("Organization not found", http_status=404)
+    field = "hold_music_file" if audio_type == "hold_music" else "ringback_file"
+    stored = (org.settings or {}).get(field) or ""
+    path = _resolve_org_audio_path(oid, audio_type, stored)
+    if path is None:
+        return error("Audio file not found", http_status=404)
+    return FileResponse(open(path, "rb"), content_type="audio/ogg")
+
+
+def _resolve_org_audio_path(oid, audio_type: str, stored_name: str) -> Path | None:
+    audio_dir = _calling_audio_dir().resolve()
+    canonical = audio_dir / f"org_{oid}_{audio_type}.ogg"
+    if canonical.is_file():
+        return canonical
+    candidates = []
+    if stored_name:
+        normalized = stored_name.replace("\\", "/").lstrip("/")
+        candidates.append(audio_dir / Path(normalized).name)
+        candidates.append(Path(dj_settings.STORAGE_LOCAL_PATH) / normalized)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        if audio_dir in resolved.parents or resolved.parent == audio_dir:
+            return resolved
+        storage_root = Path(dj_settings.STORAGE_LOCAL_PATH).resolve()
+        if storage_root in resolved.parents or resolved.parent == storage_root:
+            return resolved
+    return None

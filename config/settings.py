@@ -97,6 +97,17 @@ DATABASES = {
     }
 }
 
+_database_url = env("DATABASE_URL")
+if _database_url:
+    from apps.common.dburl import parse_database_url, with_direct_host
+
+    _parsed = parse_database_url(_database_url)
+    # Neon pooler hostnames break Django migrate / schema DDL. Same credentials, direct compute.
+    if "-pooler." in str(_parsed.get("HOST") or ""):
+        DATABASES["default"] = with_direct_host(_parsed)
+    else:
+        DATABASES["default"] = _parsed
+
 AUTH_PASSWORD_VALIDATORS = []
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -168,6 +179,8 @@ META_APP_ID = env("META_APP_ID")
 META_APP_SECRET = env("META_APP_SECRET")
 META_CONFIG_ID = env("META_CONFIG_ID")
 STORAGE_LOCAL_PATH = env("STORAGE_LOCAL_PATH", str(Path(__file__).resolve().parent.parent / "media"))
+# Shared with Go [calling] audio_dir so hold/ringback uploads play on the sidecar.
+CALLING_AUDIO_DIR = env("CALLING_AUDIO_DIR", str(BASE_DIR / "audio"))
 
 DODO_PAYMENTS_API_KEY = env("DODO_PAYMENTS_API_KEY")
 DODO_WEBHOOK_SECRET = env("DODO_WEBHOOK_SECRET")

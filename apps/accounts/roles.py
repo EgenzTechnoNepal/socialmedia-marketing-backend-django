@@ -202,13 +202,20 @@ def seed_system_roles(organization):
         ("manager", True, False, SYSTEM_ROLE_PERMS["manager"]),
         ("agent", True, True, SYSTEM_ROLE_PERMS["agent"]),
     ]
+    admin_role = None
     for name, is_system, is_default, keys in specs:
-        role = CustomRole.objects.create(
-            organization=organization,
-            name=name,
-            description=f"{name} role",
-            is_system=is_system,
-            is_default=is_default,
-        )
+        role = CustomRole.objects.filter(
+            organization=organization, name=name, is_system=True
+        ).first()
+        if role is None:
+            role = CustomRole.objects.create(
+                organization=organization,
+                name=name,
+                description=f"{name} role",
+                is_system=is_system,
+                is_default=is_default,
+            )
         _set_role_permissions(role.id, keys)
-    return CustomRole.objects.get(organization=organization, name="admin", is_system=True)
+        if name == "admin":
+            admin_role = role
+    return admin_role

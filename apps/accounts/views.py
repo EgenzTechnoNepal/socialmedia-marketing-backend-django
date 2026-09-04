@@ -72,7 +72,8 @@ def login(request):
         user = User.objects.get(email=email)
     except DatabaseError:
         return error(
-            "Database is not ready. Start Postgres and Redis, then retry.",
+            "Database tables are missing. From the Django folder run: "
+            "python manage.py migrate && python manage.py seed_admin",
             http_status=503,
             error_type="database",
         )
