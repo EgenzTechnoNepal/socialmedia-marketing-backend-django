@@ -6,6 +6,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from django.conf import settings
+from django.db import DatabaseError
 from django.http import HttpResponseRedirect
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny
@@ -122,11 +123,15 @@ def _oauth_cfg(provider: str, row: SSOProvider):
 def public_providers(request):
     seen = set()
     result = []
-    for row in SSOProvider.objects.filter(is_enabled=True):
-        if row.provider in seen:
-            continue
-        seen.add(row.provider)
-        result.append({"provider": row.provider, "name": DISPLAY_NAMES.get(row.provider, row.provider)})
+    try:
+        rows = SSOProvider.objects.filter(is_enabled=True)
+        for row in rows:
+            if row.provider in seen:
+                continue
+            seen.add(row.provider)
+            result.append({"provider": row.provider, "name": DISPLAY_NAMES.get(row.provider, row.provider)})
+    except DatabaseError:
+        return success([])
     return success(result)
 
 

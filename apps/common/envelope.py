@@ -1,3 +1,4 @@
+from django.db import DatabaseError
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
@@ -21,6 +22,13 @@ def exception_handler(exc, context):
         return error(str(exc), http_status=exc.status_code, error_type=exc.error_type)
     if isinstance(exc, APIError):
         return error(str(exc), http_status=exc.status_code, error_type=exc.error_type)
+
+    if isinstance(exc, DatabaseError):
+        return error(
+            "Database is not ready. Start Postgres (and Redis), then retry.",
+            http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            error_type="database",
+        )
 
     response = drf_exception_handler(exc, context)
     if response is None:

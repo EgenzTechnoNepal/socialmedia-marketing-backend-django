@@ -3,7 +3,7 @@ import logging
 import bcrypt
 import jwt
 from django.conf import settings
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny
 
@@ -70,6 +70,12 @@ def login(request):
 
     try:
         user = User.objects.get(email=email)
+    except DatabaseError:
+        return error(
+            "Database is not ready. Start Postgres and Redis, then retry.",
+            http_status=503,
+            error_type="database",
+        )
     except User.DoesNotExist:
         _dummy_bcrypt(password)
         return error("Invalid credentials", http_status=401)
