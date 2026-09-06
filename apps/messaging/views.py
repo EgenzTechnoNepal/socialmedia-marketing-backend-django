@@ -830,14 +830,9 @@ def save_incoming_message(account: WhatsAppAccount, contact: Contact, wamid: str
 def handle_incoming_reaction(account: WhatsAppAccount, from_phone: str, wamid: str, emoji: str, profile_name: str = ""):
     if not wamid:
         return
+
     msg = Message.objects.filter(whatsapp_message_id=wamid).first()
-    if msg is None:
-        idx = wamid.find("FQIA")
-        if idx != -1:
-            suffix_start = idx + 8
-            if suffix_start < len(wamid):
-                suffix = wamid[suffix_start:]
-                msg = Message.objects.filter(whatsapp_message_id__contains=suffix).first()
+
     if msg is None:
         logger.warning("Message not found for reaction wamid=%s", wamid)
         return
