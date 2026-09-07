@@ -79,6 +79,12 @@ def organizations_collection(request):
     UserOrganization.objects.create(
         user=request.user, organization=org, role_id=admin_role.id, is_default=False
     )
+    try:
+        from apps.analytics.seed_widgets import seed_default_widgets_for_org
+
+        seed_default_widgets_for_org(org, request.user)
+    except Exception:
+        logger.exception("Failed to seed default dashboard widgets for org %s", org.id)
     return success(_org_payload(org), http_status=201)
 
 

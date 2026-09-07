@@ -154,12 +154,17 @@ COOKIE_DOMAIN = env("COOKIE_DOMAIN") or None
 
 REDIS_URL = env("REDIS_URL", "redis://127.0.0.1:6379/0")
 _redis = urlparse(REDIS_URL)
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {"hosts": [(_redis.hostname or "127.0.0.1", _redis.port or 6379)]},
+# Single-process Daphne + Redis timeouts were dropping /ws and looping the Vue toast.
+# In-memory is correct for local DEBUG. Production still uses Redis.
+if DEBUG:
+    CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
+else:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {"hosts": [REDIS_URL]},
+        }
     }
-}
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", DEBUG)

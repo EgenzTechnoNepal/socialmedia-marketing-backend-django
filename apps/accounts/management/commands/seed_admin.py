@@ -98,6 +98,15 @@ class Command(BaseCommand):
             )
 
         try:
+            from apps.analytics.seed_widgets import seed_default_widgets_for_org
+
+            created_widgets = seed_default_widgets_for_org(org, user)
+            if created_widgets:
+                self.stdout.write(f"Seeded {created_widgets} default dashboard widgets")
+        except Exception as exc:
+            self.stdout.write(self.style.WARNING(f"dashboard widgets skipped: {exc}"))
+
+        try:
             call_command("seed_billing")
         except Exception as exc:
             self.stdout.write(self.style.WARNING(f"seed_billing skipped: {exc}"))

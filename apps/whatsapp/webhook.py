@@ -92,6 +92,7 @@ def _download_media(account: WhatsAppAccount, media: dict, msg_type: str):
 def webhook_receive(request):
     if request.method == "GET":
         return webhook_verify(request)
+    logger.info("WhatsApp webhook POST bytes=%s", len(request.body or b""))
     try:
         payload = json.loads(request.body.decode("utf-8") or "{}")
     except json.JSONDecodeError:
