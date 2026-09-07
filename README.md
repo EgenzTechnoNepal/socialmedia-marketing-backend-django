@@ -145,6 +145,8 @@ Webhook URL you give Meta:
 
 Verify token must match `WHATSAPP_WEBHOOK_VERIFY_TOKEN`.
 
+For a shared Meta test app, one machine runs `cloudflared tunnel --url http://127.0.0.1:8000` and that hostname is what Meta calls. Put the same host in every developer’s `.env` as `PUBLIC_API_URL` so Settings → WhatsApp shows the shared callback, not `localhost`. Keep Vue on `http://localhost:3000` and leave `VITE_API_URL` empty (login cookies will not work if the frontend calls the tunnel host). Do not paste `http://localhost:3000/api/webhook` into Meta.
+
 ### 2.7 Billing (Dodo) — optional until you test checkout
 
 ```env

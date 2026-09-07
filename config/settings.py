@@ -177,6 +177,18 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 PUBLIC_APP_URL = env("PUBLIC_APP_URL", "http://localhost:3000").rstrip("/")
+# Shared cloudflared (or other public) host that Meta calls. Not the Vue origin.
+# Example: https://peers-maintained-pig-bridge.trycloudflare.com
+PUBLIC_API_URL = env(
+    "PUBLIC_API_URL",
+    "https://peers-maintained-pig-bridge.trycloudflare.com",
+).rstrip("/")
+CSRF_TRUSTED_ORIGINS = env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+)
+if PUBLIC_API_URL:
+    CSRF_TRUSTED_ORIGINS = [*CSRF_TRUSTED_ORIGINS, PUBLIC_API_URL]
 ENCRYPTION_KEY = env("ENCRYPTION_KEY")
 WHATSAPP_WEBHOOK_VERIFY_TOKEN = env("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
 WHATSAPP_API_VERSION = env("WHATSAPP_API_VERSION", "v24.0")

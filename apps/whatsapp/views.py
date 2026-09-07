@@ -13,6 +13,13 @@ from services.whatsapp_client import WhatsAppError
 from services import whatsapp_client
 
 
+def _public_webhook_url() -> str:
+    base = (getattr(settings, "PUBLIC_API_URL", "") or "").rstrip("/")
+    if base:
+        return f"{base}/api/webhook"
+    return ""
+
+
 def _account_payload(account: WhatsAppAccount) -> dict:
     return {
         "id": str(account.id),
@@ -20,6 +27,7 @@ def _account_payload(account: WhatsAppAccount) -> dict:
         "app_id": account.app_id or "",
         "phone_id": account.phone_id,
         "business_id": account.business_id,
+        "webhook_url": _public_webhook_url(),
         "webhook_verify_token": account.webhook_verify_token or "",
         "api_version": account.api_version or "v21.0",
         "is_default_incoming": account.is_default_incoming,
