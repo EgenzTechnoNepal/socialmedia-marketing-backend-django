@@ -5,10 +5,17 @@ import logging
 from django.conf import settings
 from rest_framework.decorators import api_view, permission_classes
 
+
+from .serializers import PaymentProfileSerializer
+
 from apps.common.envelope import error, success
 from apps.common.exceptions import APIError
-from apps.common.permissions import CookieAuthenticated, HasBillingAccess, request_organization_id
-
+from apps.common.permissions import (
+    CookieAuthenticated,
+    HasOrg,
+    HasBillingAccess,
+    request_organization_id,
+)
 from .entitlements import (
     METER_AI_COMPLETION,
     METER_CAMPAIGN_RECIPIENT,
@@ -18,7 +25,13 @@ from .entitlements import (
     quota_for,
     seats_used,
 )
-from .models import PLAN_FREE, STATUS_ACTIVE, BillingPlan, OrganizationSubscription
+from .models import (
+    PLAN_FREE,
+    STATUS_ACTIVE,
+    BillingPlan,
+    OrganizationSubscription,
+    PaymentProfile,
+)
 from .services import dodo
 from .services.dodo import DodoNotConfigured
 
@@ -250,3 +263,96 @@ def invoices(request):
         logger.exception("Dodo invoices failed")
         return error("Failed to load invoices", http_status=502)
     return success({"invoices": items})
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated, HasOrg, HasBillingAccess])
+def create_payment_profile(request):
+    """
+    Create a payment profile for the authenticated user's organization.
+    Each organization can have only one payment profile.
+    """
+    org_id = _org(request)
+
+    if PaymentProfile.objects.filter(organization_id=org_id).exists():
+        return error(
+            "Payment profile already exists",
+            http_status=400,
+        )
+
+    serializer = PaymentProfileSerializer(data=request.data)
+
+    if not serializer.is_valid():
+        return error(
+            "Validation failed",
+            http_status=400,
+            extra=serializer.errors,
+        )
+
+    payment_profile = serializer.save(
+        organization_id=org_id
+    )
+
+    return success(
+        PaymentProfileSerializer(payment_profile).data,
+        http_status=201,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([CookieAuthenticated, HasOrg, HasBillingAccess])
+def get_payment_profile(request):
+    """
+    Retrieve the payment profile belonging to the authenticated user's organization.
+    """
+    org_id = _org(request)
+
+    try:
+        payment_profile = PaymentProfile.objects.get(
+            organization_id=org_id
+        )
+    except PaymentProfile.DoesNotExist:
+        return error(
+            "Payment profile not found",
+            http_status=404,
+        )
+
+    return success(
+        PaymentProfileSerializer(payment_profile).data
+    )
+
+
+@api_view(["PUT", "PATCH"])
+@permission_classes([CookieAuthenticated, HasOrg, HasBillingAccess])
+def update_payment_profile(request):
+    """
+    Update the payment profile belonging to the authenticated user's organization.
+    """
+    org_id = _org(request)
+
+    try:
+        payment_profile = PaymentProfile.objects.get(
+            organization_id=org_id
+        )
+    except PaymentProfile.DoesNotExist:
+        return error(
+            "Payment profile not found",
+            http_status=404,
+        )
+
+    serializer = PaymentProfileSerializer(
+        payment_profile,
+        data=request.data,
+        partial=request.method == "PATCH",
+    )
+
+    if not serializer.is_valid():
+        return error(
+            "Validation failed",
+            http_status=400,
+            extra=serializer.errors,
+        )
+
+    payment_profile = serializer.save()
+
+    return success(
+        PaymentProfileSerializer(payment_profile).data
+    )

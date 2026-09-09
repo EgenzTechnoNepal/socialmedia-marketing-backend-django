@@ -180,3 +180,32 @@ class DodoWebhookEvent(models.Model):
 
     class Meta:
         db_table = "dodo_webhook_events"
+
+class PaymentProfile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    organization = models.OneToOneField(
+    "accounts.Organization",
+    on_delete=models.CASCADE,
+    related_name="payment_profile",
+    db_constraint=False,
+    )
+
+    billing_name = models.CharField(max_length=255)
+    billing_email = models.EmailField()
+    phone = models.CharField(max_length=32, blank=True)
+    address = models.TextField(blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    postal_code = models.CharField(max_length=32, blank=True)
+    country = models.CharField(max_length=100, blank=True)
+    tax_id = models.CharField(max_length=100, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "payment_profiles"
+
+    def __str__(self):
+        return f"Payment Profile - {self.billing_email}"        
