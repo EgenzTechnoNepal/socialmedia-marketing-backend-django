@@ -11,6 +11,7 @@ urlpatterns = [
     path("portal", views.customer_portal),
     path("usage", views.usage),
     path("invoices", views.invoices),
+    path("invoices/<str:payment_id>/pdf", views.invoice_pdf),
     path("payment-profile", views.get_payment_profile),
     path("payment-profile/create", views.create_payment_profile),
     path("payment-profile/update", views.update_payment_profile),

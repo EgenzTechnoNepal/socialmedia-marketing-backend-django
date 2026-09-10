@@ -131,6 +131,18 @@ def list_payments(customer_id: str, limit: int = 20) -> list[dict[str, Any]]:
     return out
 
 
+def get_payment_details(payment_id: str) -> dict[str, Any]:
+    client = _client()
+
+    payment = client.payments.retrieve(payment_id)
+    line_items = client.payments.retrieve_line_items(payment_id)
+
+    return {
+        "payment": payment,
+        "line_items": line_items,
+    }
+
+
 def ingest_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return

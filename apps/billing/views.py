@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 
 from django.conf import settings
+from django.http import HttpResponse
 from rest_framework.decorators import api_view, permission_classes
-
 
 from .serializers import PaymentProfileSerializer
 
@@ -34,6 +34,7 @@ from .models import (
 )
 from .services import dodo
 from .services.dodo import DodoNotConfigured
+from .services.invoice import build_invoice_data, generate_invoice_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,94 @@ def invoices(request):
         logger.exception("Dodo invoices failed")
         return error("Failed to load invoices", http_status=502)
     return success({"invoices": items})
+
+@api_view(["GET"])
+@permission_classes([CookieAuthenticated, HasBillingAccess])
+def invoice_pdf(request, payment_id):
+    """
+    Generate and return a PDF invoice for a successful Dodo payment.
+    The payment must belong to the authenticated organization's
+    Dodo customer.
+    """
+    org_id = _org(request)
+    sub = get_or_create_subscription(org_id)
+
+    if not sub.dodo_customer_id:
+        return error(
+            "No Dodo customer on this organization",
+            http_status=404,
+        )
+
+    try:
+        details = dodo.get_payment_details(payment_id)
+    except DodoNotConfigured as exc:
+        return error(str(exc), http_status=503)
+    except Exception:
+        logger.exception("Dodo payment retrieval failed")
+        return error(
+            "Failed to retrieve payment",
+            http_status=502,
+        )
+
+    payment = details["payment"]
+
+    # Prevent cross-organization access.
+    payment_customer = getattr(payment, "customer", None)
+    payment_customer_id = getattr(payment_customer, "customer_id", "")
+
+    if payment_customer_id != sub.dodo_customer_id:
+        return error(
+            "Payment does not belong to this organization",
+            http_status=403,
+        )
+
+    if payment.status != "succeeded":
+        return error(
+            "Invoice is only available for successful payments",
+            http_status=400,
+        )
+
+    # Get the existing Payment Profile for this organization.
+    payment_profile = PaymentProfile.objects.filter(
+        organization_id=org_id
+    ).first()
+
+    try:
+        invoice_data = build_invoice_data(
+            payment,
+            details["line_items"],
+            payment_profile=payment_profile,
+        )
+
+        pdf_bytes = generate_invoice_pdf(invoice_data)
+    except ValueError as exc:
+        return error(
+            str(exc),
+            http_status=400,
+        )
+    except Exception:
+        logger.exception("Invoice PDF generation failed")
+        return error(
+            "Failed to generate invoice PDF",
+            http_status=500,
+        )
+
+    response = HttpResponse(
+        pdf_bytes,
+        content_type="application/pdf",
+    )
+
+    invoice_number = (
+        invoice_data.get("invoice_id")
+        or payment.payment_id
+    )
+
+    response["Content-Disposition"] = (
+        f'attachment; filename="invoice-{invoice_number}.pdf"'
+    )
+
+    return response
+
 @api_view(["POST"])
 @permission_classes([CookieAuthenticated, HasOrg, HasBillingAccess])
 def create_payment_profile(request):
