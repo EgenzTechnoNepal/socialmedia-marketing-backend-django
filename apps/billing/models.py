@@ -14,6 +14,10 @@ STATUS_ON_HOLD = "on_hold"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
 
+INTERVAL_MONTHLY="monthly"
+INTERVAL_YEARLY="yearly"
+BILLING_INTERVALS=(INTERVAL_MONTHLY,INTERVAL_YEARLY)
+
 METER_MESSAGE_SENT = "message.sent"
 METER_AI_COMPLETION = "ai.completion"
 METER_CAMPAIGN_RECIPIENT = "campaign.recipient"
@@ -66,9 +70,20 @@ class BillingPlan(models.Model):
     key = models.CharField(max_length=32, unique=True)
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True)
+
+    currency = models.CharField(max_length=3, default="USD")
+    price_monthly = models.PositiveIntegerField(default=0)  # minor units (e.g. cents)
+    price_yearly = models.PositiveIntegerField(default=0)   # minor units (e.g. cents)
+
     dodo_product_id = models.CharField(max_length=128, blank=True)
+    dodo_price_id_monthly = models.CharField(max_length=128, blank=True)
+    dodo_price_id_yearly = models.CharField(max_length=128, blank=True)
     dodo_seat_addon_id = models.CharField(max_length=128, blank=True)
+    extra_seat_price_monthly = models.PositiveIntegerField(default=0)
+    extra_seat_price_yearly = models.PositiveIntegerField(default=0)
+
     included_seats = models.PositiveIntegerField(default=1)
+    included_wa_accounts = models.PositiveIntegerField(default=1)
     features = models.JSONField(default=dict)
     included_quotas = models.JSONField(default=dict)
     display_order = models.PositiveSmallIntegerField(default=0)
@@ -82,12 +97,43 @@ class BillingPlan(models.Model):
 
     def __str__(self):
         return self.key
-
+    
+    #this checks if it is a free plan or not
     @property
     def is_paid(self):
-        return self.key != PLAN_FREE and bool(self.dodo_product_id)
+        return self.key != PLAN_FREE
+    
+    @property
+    def is_checkout_ready(self):
+        return self.is_paid and bool(self.dodo_product_id)
+        
+    def is_checkout_ready_for_interval(self, interval: str) -> bool:
+        return self.is_checkout_ready and bool(self.dodo_price_id_for_interval(interval))
 
+    def price_for_interval(self, interval: str) -> int:
+        if interval == INTERVAL_YEARLY:
+            return self.price_yearly
+        elif interval == INTERVAL_MONTHLY:
+            return self.price_monthly
+        raise ValueError(f"Unknown billing interval: {interval}")
 
+    def dodo_price_id_for_interval(self, interval: str) -> str:
+        if interval == INTERVAL_YEARLY:
+            return self.dodo_price_id_yearly
+        elif interval == INTERVAL_MONTHLY:
+            return self.dodo_price_id_monthly
+        raise ValueError(f"Unknown billing interval: {interval}")
+    
+    def dodo_product_id_for_interval(self, interval: str) -> str:
+        """Dodo sells monthly and yearly as two separate subscription products."""
+        return self.dodo_price_id_for_interval(interval)
+    
+    def extra_seat_price_for_interval(self, interval: str) -> int:
+        if interval == INTERVAL_YEARLY:
+            return self.extra_seat_price_yearly
+        elif interval == INTERVAL_MONTHLY:
+            return self.extra_seat_price_monthly
+        raise ValueError(f"Unknown billing interval: {interval}")
 class OrganizationSubscription(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.OneToOneField(
@@ -98,11 +144,24 @@ class OrganizationSubscription(models.Model):
     )
     plan = models.ForeignKey(BillingPlan, on_delete=models.PROTECT, related_name="subscriptions")
     status = models.CharField(max_length=32, default=STATUS_FREE)
+    billing_interval = models.CharField(
+        max_length=16, choices=[(i, i) for i in BILLING_INTERVALS], default=INTERVAL_MONTHLY
+    )
     dodo_customer_id = models.CharField(max_length=128, blank=True)
     dodo_subscription_id = models.CharField(max_length=128, blank=True)
     extra_seats = models.PositiveIntegerField(default=0)
+
+    pending_plan = models.ForeignKey(
+        BillingPlan, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="pending_subscriptions",
+    )
+    pending_billing_interval = models.CharField(
+        max_length=16, choices=[(i, i) for i in BILLING_INTERVALS], null=True, blank=True
+    )
     current_period_start = models.DateTimeField(null=True, blank=True)
     current_period_end = models.DateTimeField(null=True, blank=True)
+    cancel_at_period_end = models.BooleanField(default=False)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -181,6 +240,34 @@ class DodoWebhookEvent(models.Model):
     class Meta:
         db_table = "dodo_webhook_events"
 
+
+class BillingPayment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        "accounts.Organization",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_constraint=False,
+        related_name="billing_payments",
+    )
+    payment_id = models.CharField(max_length=128, unique=True)
+    subscription_id = models.CharField(max_length=128, blank=True)
+    customer_id = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=32)
+    amount = models.PositiveIntegerField(null=True, blank=True)
+    currency = models.CharField(max_length=3, blank=True)
+    refund_status = models.CharField(max_length=32, blank=True)
+    refund_amount = models.PositiveIntegerField(null=True, blank=True)
+    payload = models.JSONField(default=dict)
+    occurred_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "billing_payments"
+
+
 class PaymentProfile(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -208,4 +295,4 @@ class PaymentProfile(models.Model):
         db_table = "payment_profiles"
 
     def __str__(self):
-        return f"Payment Profile - {self.billing_email}"        
+        return f"Payment Profile - {self.billing_email}"

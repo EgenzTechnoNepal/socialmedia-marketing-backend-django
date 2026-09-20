@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from django.utils import timezone as dj_tz
 import logging
 
 from django.conf import settings
@@ -7,7 +7,7 @@ from django.http import HttpResponse
 from rest_framework.decorators import api_view, permission_classes
 
 from .serializers import PaymentProfileSerializer
-
+from django.urls import reverse
 from apps.common.envelope import error, success
 from apps.common.exceptions import APIError
 from apps.common.permissions import (
@@ -22,12 +22,19 @@ from .entitlements import (
     METER_MESSAGE_SENT,
     current_usage,
     get_or_create_subscription,
+    period_start,
     quota_for,
     seats_used,
+    whatsapp_accounts_used,
 )
 from .models import (
+    BILLING_INTERVALS,
+    INTERVAL_MONTHLY,
+    INTERVAL_YEARLY,
     PLAN_FREE,
     STATUS_ACTIVE,
+    STATUS_CANCELLED,
+    STATUS_ON_HOLD,
     BillingPlan,
     OrganizationSubscription,
     PaymentProfile,
@@ -40,6 +47,37 @@ logger = logging.getLogger(__name__)
 
 METERS = (METER_MESSAGE_SENT, METER_AI_COMPLETION, METER_CAMPAIGN_RECIPIENT)
 
+MAX_EXTRA_SEATS = 500
+
+
+def _parse_interval(raw) -> str:
+    interval = str(raw or INTERVAL_MONTHLY).strip().lower()
+    if interval not in BILLING_INTERVALS:
+        raise APIError("billing_interval must be 'monthly' or 'yearly'", status_code=400)
+    return interval
+
+def _plan_change_blockers(org_id, plan, extra_seats) -> list[str]:
+    """Reasons this org cannot move to `plan` right now (empty list = allowed)."""
+    problems = []
+    used_seats = seats_used(org_id)
+    seat_limit = plan.included_seats + extra_seats
+    if used_seats > seat_limit:
+        problems.append(f"{used_seats} active agents exceed the {seat_limit} seats allowed")
+    wa_used = whatsapp_accounts_used(org_id)
+    if wa_used > plan.included_wa_accounts:
+        problems.append(f"{wa_used} WhatsApp accounts exceed the {plan.included_wa_accounts} allowed")
+    return problems
+
+def _parse_extra_seats(raw, default: int = 0) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise APIError("extra_seats must be a whole number", status_code=400)
+    if value < 0 or value > MAX_EXTRA_SEATS:
+        raise APIError(f"extra_seats must be between 0 and {MAX_EXTRA_SEATS}", status_code=400)
+    return value
 
 def _org(request):
     org_id = request_organization_id(request)
@@ -53,11 +91,26 @@ def _plan_payload(plan: BillingPlan):
         "key": plan.key,
         "name": plan.name,
         "description": plan.description,
+        "currency": plan.currency,
+        "display_order": plan.display_order,
+        "prices": {
+            "monthly": plan.price_monthly,
+            "yearly": plan.price_yearly,
+        },
+        "extra_seat_prices": {
+            "monthly": plan.extra_seat_price_monthly,
+            "yearly": plan.extra_seat_price_yearly,
+        },
         "included_seats": plan.included_seats,
+        "included_wa_accounts": plan.included_wa_accounts,
         "features": plan.features,
         "included_quotas": plan.included_quotas,
         "is_paid": plan.is_paid,
         "has_product": bool(plan.dodo_product_id),
+        "checkout_ready": {
+            "monthly": plan.is_checkout_ready_for_interval(INTERVAL_MONTHLY),
+            "yearly": plan.is_checkout_ready_for_interval(INTERVAL_YEARLY),
+        },
     }
 
 
@@ -66,10 +119,16 @@ def _sub_payload(sub: OrganizationSubscription, org_id):
     return {
         "plan": _plan_payload(sub.plan),
         "status": sub.status,
+        "is_usable": sub.is_usable,
+        "billing_interval": sub.billing_interval,
         "extra_seats": sub.extra_seats,
         "seat_limit": sub.seat_limit,
         "seats_used": used,
         "seats_available": max(sub.seat_limit - used, 0),
+        "cancel_at_period_end": sub.cancel_at_period_end,
+        "cancelled_at": sub.cancelled_at.isoformat() if sub.cancelled_at else None,
+        "pending_plan": sub.pending_plan.key if sub.pending_plan else None,
+        "pending_billing_interval": sub.pending_billing_interval,
         "dodo_customer_id": sub.dodo_customer_id,
         "dodo_subscription_id": sub.dodo_subscription_id,
         "current_period_start": sub.current_period_start.isoformat() if sub.current_period_start else None,
@@ -98,27 +157,48 @@ def get_subscription(request):
 def create_checkout(request):
     org_id = _org(request)
     plan_key = (request.data.get("plan_key") or "").strip()
-    extra_seats = int(request.data.get("extra_seats") or 0)
-    if extra_seats < 0:
-        return error("extra_seats must be >= 0")
+    interval = _parse_interval(request.data.get("billing_interval"))
+    extra_seats = _parse_extra_seats(request.data.get("extra_seats"))
+    
     if plan_key == PLAN_FREE:
         return error("Free plan does not require checkout")
 
     plan = BillingPlan.objects.filter(key=plan_key, is_active=True).first()
-    if not plan or not plan.dodo_product_id:
-        return error("Unknown or unconfigured plan", http_status=400)
+    if not plan or not plan.is_paid:
+        return error("Unknown plan", http_status=400)
+    if not plan.is_checkout_ready_for_interval(interval):
+        return error(f"{plan.name} {interval} billing is not available yet", http_status=400)
+
+    seat_addon_id = plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT
+    if extra_seats and not seat_addon_id:
+        return error("Extra seats are not available right now", http_status=400)
+
+    sub = get_or_create_subscription(org_id)
+    if sub.dodo_subscription_id and sub.status in (STATUS_ACTIVE, STATUS_ON_HOLD):
+        return error(
+            "This organization already has a subscription. Use change-plan instead.",
+            http_status=409,
+        )
 
     user = request.user
+    profile = PaymentProfile.objects.filter(organization_id=org_id).first()
+    customer_email = (profile.billing_email if profile else "") or user.email
+    customer_name = (profile.billing_name if profile else "") or user.full_name
     try:
         session = dodo.create_checkout_session(
-            product_id=plan.dodo_product_id,
+            product_id=plan.dodo_product_id_for_interval(interval),
             extra_seats=extra_seats,
-            seat_addon_id=plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT,
-            customer_email=user.email,
-            customer_name=user.full_name,
+            seat_addon_id=seat_addon_id,
+            customer_email=customer_email,
+            customer_name=customer_name,
             organization_id=str(org_id),
-            customer_id=get_or_create_subscription(org_id).dodo_customer_id,
+            customer_id=sub.dodo_customer_id,
             return_url=f"{settings.DODO_RETURN_URL}?status=checkout",
+            metadata={
+                "plan_key": plan.key,
+                "billing_interval": interval,
+                "extra_seats": str(extra_seats),
+            },
         )
     except DodoNotConfigured as exc:
         return error(str(exc), http_status=503)
@@ -134,31 +214,32 @@ def create_checkout(request):
 def change_plan(request):
     org_id = _org(request)
     sub = get_or_create_subscription(org_id)
-    plan_key = (request.data.get("plan_key") or "").strip()
-    extra_seats = request.data.get("extra_seats")
-    if extra_seats is None:
-        extra_seats = sub.extra_seats
-    extra_seats = int(extra_seats)
-
+    plan_key = str(request.data.get("plan_key") or "").strip()
+    interval = _parse_interval(request.data.get("billing_interval") or sub.billing_interval)
+    extra_seats = _parse_extra_seats(request.data.get("extra_seats"), default=sub.extra_seats)
+    
     plan = BillingPlan.objects.filter(key=plan_key, is_active=True).first()
     if not plan:
-        return error("Unknown plan")
+        return error("Unknown plan", http_status=400)
     if plan.key == PLAN_FREE:
-        return error("Use Dodo customer portal or cancel to return to Free")
-    if not sub.dodo_subscription_id:
-        return error("No active Dodo subscription. Start checkout first.")
-    if extra_seats < 0:
-        return error("extra_seats must be >= 0")
-    used = seats_used(org_id)
-    if used > plan.included_seats + extra_seats:
-        return error(f"Cannot reduce seats below active agents ({used})")
+        return error("To move back to Free, cancel the subscription instead", http_status=400)
+    if not sub.dodo_subscription_id or sub.status != STATUS_ACTIVE:
+        return error("No active subscription. Start checkout first.", http_status=409)
+    if sub.cancel_at_period_end:
+        return error("This subscription is scheduled to cancel and cannot be changed.", http_status=409)
+    if not plan.is_checkout_ready_for_interval(interval):
+        return error(f"{plan.name} {interval} billing is not available yet", http_status=400)
+    problems = _plan_change_blockers(org_id, plan, extra_seats)
+    if problems:
+        return error(f"Cannot switch to {plan.name}: " + "; ".join(problems), http_status=409)
 
     try:
         dodo.change_plan(
             subscription_id=sub.dodo_subscription_id,
-            product_id=plan.dodo_product_id,
+            product_id=plan.dodo_product_id_for_interval(interval),
             extra_seats=extra_seats,
             seat_addon_id=plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT,
+            proration_billing_mode="prorated_immediately",
         )
     except DodoNotConfigured as exc:
         return error(str(exc), http_status=503)
@@ -166,23 +247,52 @@ def change_plan(request):
         logger.exception("Dodo change_plan failed")
         return error("Failed to change plan", http_status=502)
 
-    sub.plan = plan
-    sub.extra_seats = extra_seats
-    sub.status = STATUS_ACTIVE
-    sub.save(update_fields=["plan", "extra_seats", "status", "updated_at"])
-    return success(_sub_payload(sub, org_id))
+    sub.pending_plan = plan
+    sub.pending_billing_interval = interval
+    sub.save(update_fields=["pending_plan", "pending_billing_interval", "updated_at"])
 
+    payload = _sub_payload(sub, org_id)
+    payload["change_requested"] = {
+        "plan": plan.key,
+        "billing_interval": interval,
+        "extra_seats": extra_seats,
+    }
+    return success(payload)
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated, HasBillingAccess])
+def cancel_subscription(request):
+    org_id = _org(request)
+    sub = get_or_create_subscription(org_id)
+    
+    if not sub.dodo_subscription_id:
+        return error("No active Dodo subscription to cancel", http_status=400)
+    if sub.status == STATUS_CANCELLED or sub.cancel_at_period_end:
+        return error("Subscription is already cancelled ", http_status=400)
+
+    try:
+        dodo.cancel_subscription(sub.dodo_subscription_id)
+    except DodoNotConfigured as exc:
+        return error(str(exc), http_status=503)
+    except Exception:
+        logger.exception("Dodo cancel failed")
+        return error("Failed to cancel subscription", http_status=502)
+
+    sub.cancel_at_period_end = True
+    sub.cancelled_at = dj_tz.now()
+    sub.save(update_fields=["cancel_at_period_end", "cancelled_at", "updated_at"])
+    return success(_sub_payload(sub, org_id))
 
 @api_view(["POST"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
 def update_seats(request):
     org_id = _org(request)
     sub = get_or_create_subscription(org_id)
-    extra_seats = int(request.data.get("extra_seats") or 0)
-    if extra_seats < 0:
-        return error("extra_seats must be >= 0")
+    extra_seats = _parse_extra_seats(request.data.get("extra_seats"))
+
     if not sub.dodo_subscription_id or not sub.plan.is_paid:
         return error("Seat add-ons require an active paid subscription")
+    if sub.status != STATUS_ACTIVE or sub.cancel_at_period_end:
+        return error("Seats can only be changed on an active, non-cancelling subscription", http_status=409)
     used = seats_used(org_id)
     if used > sub.plan.included_seats + extra_seats:
         return error(f"Cannot reduce seats below active agents ({used})")
@@ -190,19 +300,20 @@ def update_seats(request):
     try:
         dodo.change_plan(
             subscription_id=sub.dodo_subscription_id,
-            product_id=sub.plan.dodo_product_id,
+            product_id=sub.plan.dodo_product_id_for_interval(sub.billing_interval),
             extra_seats=extra_seats,
             seat_addon_id=sub.plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT,
         )
-    except DodoNotConfigured as extra:
-        return error(str(extra), http_status=503)
+    except DodoNotConfigured as exc:
+        return error(str(exc), http_status=503)
     except Exception:
         logger.exception("Dodo seat change failed")
         return error("Failed to update seats", http_status=502)
 
-    sub.extra_seats = extra_seats
-    sub.save(update_fields=["extra_seats", "updated_at"])
-    return success(_sub_payload(sub, org_id))
+    payload = _sub_payload(sub, org_id)
+    payload["change_requested"] = {"extra_seats": extra_seats}
+    return success(payload)
+    
 
 
 @api_view(["POST"])
@@ -227,6 +338,7 @@ def customer_portal(request):
 def usage(request):
     org_id = _org(request)
     sub = get_or_create_subscription(org_id)
+    hard_cap = bool((sub.plan.features or {}).get("hard_cap_usage"))
     meters = []
     for meter in METERS:
         used = current_usage(org_id, meter)
@@ -237,13 +349,26 @@ def usage(request):
                 "used": used,
                 "included": included,
                 "remaining": None if not (sub.plan.features or {}).get("hard_cap_usage") else max(included - used, 0),
+                "overage": max(used - included, 0),
+                "hard_cap": hard_cap,
             }
         )
+
+    seats_now = seats_used(org_id)
+    wa_now = whatsapp_accounts_used(org_id)
     return success(
         {
-            "period_start": sub.current_period_start.isoformat()
-            if sub.current_period_start
-            else None,
+            "period_start": period_start().isoformat(),
+            "seats": {
+                "used": seats_now,
+                "included": sub.plan.included_seats,
+                "extra": sub.extra_seats,
+                "limit": sub.seat_limit,
+            },
+            "whatsapp_accounts": {
+                "used": wa_now,
+                "limit": sub.plan.included_wa_accounts,
+            },
             "meters": meters,
         }
     )
@@ -263,6 +388,15 @@ def invoices(request):
     except Exception:
         logger.exception("Dodo invoices failed")
         return error("Failed to load invoices", http_status=502)
+    for item in items:
+        # invoice_pdf only serves successful payments (see its 400 guard below),
+        # so don't hand the frontend a link that will 400 if it's clicked.
+        item["invoice_url"] = (
+            reverse("billing-invoice-pdf", args=[item["id"]])
+            if item.get("status") == "succeeded"
+            else None
+        )
+
     return success({"invoices": items})
 
 @api_view(["GET"])

@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import views,webhooks
 
 urlpatterns = [
     path("plans", views.list_plans),
@@ -11,8 +11,11 @@ urlpatterns = [
     path("portal", views.customer_portal),
     path("usage", views.usage),
     path("invoices", views.invoices),
-    path("invoices/<str:payment_id>/pdf", views.invoice_pdf),
+    path("invoices/<str:payment_id>/pdf", views.invoice_pdf, name="billing-invoice-pdf"),
     path("payment-profile", views.get_payment_profile),
     path("payment-profile/create", views.create_payment_profile),
     path("payment-profile/update", views.update_payment_profile),
+    path("subscription/cancel", views.cancel_subscription, name="billing-cancel-subscription"),
+    path("webhooks/dodo", webhooks.dodo_webhook),
 ]
+

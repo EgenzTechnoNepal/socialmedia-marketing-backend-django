@@ -23,7 +23,15 @@ PLANS = [
         "description": "1 seat, limited messages, no campaigns or AI.",
         "included_seats": 1,
         "display_order": 0,
+        "currency": "USD",
+        "price_monthly": 0,
+        "price_yearly": 0,
         "product_env": "",
+        "price_monthly_env": "",
+        "price_yearly_env": "",
+        "extra_seat_price_monthly": 0,
+        "extra_seat_price_yearly": 0,
+        "included_wa_accounts": 1,
     },
     {
         "key": PLAN_PRO,
@@ -31,7 +39,15 @@ PLANS = [
         "description": "3 seats included, campaigns, AI, calling, usage overage.",
         "included_seats": 3,
         "display_order": 1,
+        "currency": "USD",
+        "price_monthly": 2900,       # TODO: confirm — $29.00
+        "price_yearly": 29000,       # TODO: confirm — $290.00 (2 months free)
         "product_env": "DODO_PRODUCT_PRO",
+        "price_monthly_env": "DODO_PRICE_PRO_MONTHLY",
+        "price_yearly_env": "DODO_PRICE_PRO_YEARLY",
+        "extra_seat_price_monthly":500,
+        "extra_seat_price_yearly":5000,
+        "included_wa_accounts": 3,
     },
     {
         "key": PLAN_BUSINESS,
@@ -39,7 +55,15 @@ PLANS = [
         "description": "10 seats included, higher usage, all features.",
         "included_seats": 10,
         "display_order": 2,
+        "currency": "USD",
+        "price_monthly": 9900,       # TODO: confirm — $99.00
+        "price_yearly": 99000,       # TODO: confirm — $990.00
         "product_env": "DODO_PRODUCT_BUSINESS",
+        "price_monthly_env": "DODO_PRICE_BUSINESS_MONTHLY",
+        "price_yearly_env": "DODO_PRICE_BUSINESS_YEARLY",
+        "extra_seat_price_monthly": 500,
+        "extra_seat_price_yearly": 5000,
+        "included_wa_accounts": 10,  
     },
 ]
 
@@ -57,6 +81,14 @@ class Command(BaseCommand):
         addon = settings.DODO_ADDON_SEAT
         for spec in PLANS:
             product_id = getattr(settings, spec["product_env"], "") if spec["product_env"] else ""
+            price_id_monthly = (
+                getattr(settings, spec["price_monthly_env"], "")
+                if spec["price_monthly_env"] else ""
+            )
+            price_id_yearly = (
+                getattr(settings, spec["price_yearly_env"], "")
+                if spec["price_yearly_env"] else ""
+            )
             plan, created = BillingPlan.objects.update_or_create(
                 key=spec["key"],
                 defaults={
@@ -66,13 +98,26 @@ class Command(BaseCommand):
                     "features": DEFAULT_FEATURES[spec["key"]],
                     "included_quotas": DEFAULT_QUOTAS[spec["key"]],
                     "display_order": spec["display_order"],
+                    "currency": spec["currency"],
+                    "price_monthly": spec["price_monthly"],
+                    "price_yearly": spec["price_yearly"],
                     "dodo_product_id": product_id or "",
+                    "dodo_price_id_monthly": price_id_monthly or "",
+                    "dodo_price_id_yearly": price_id_yearly or "",
                     "dodo_seat_addon_id": addon if spec["key"] != PLAN_FREE else "",
                     "is_active": True,
+                    "extra_seat_price_monthly": spec["extra_seat_price_monthly"],
+                    "extra_seat_price_yearly": spec["extra_seat_price_yearly"],
+                    "included_wa_accounts": spec["included_wa_accounts"],
                 },
             )
             self.stdout.write(f"  plan {plan.key} ({'created' if created else 'updated'})")
-
+            if plan.is_paid:
+                for interval in ("monthly", "yearly"):
+                    if not plan.is_checkout_ready_for_interval(interval):
+                        self.stdout.write(self.style.WARNING(
+                            f"    ! {plan.key}: Dodo IDs missing for {interval}, checkout disabled for {interval}"
+                        ))
     def _seed_subscriptions(self):
         free = BillingPlan.objects.get(key=PLAN_FREE)
         for org in Organization.objects.all():

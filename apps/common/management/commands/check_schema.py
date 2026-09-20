@@ -8,6 +8,7 @@ EXPECTED_TABLES = (
     "api_keys",
     "audit_logs",
     "billing_plans",
+    "billing_payments",
     "billing_usage_counters",
     "billing_usage_outbox",
     "bulk_message_campaigns",
