@@ -163,7 +163,25 @@ DODO_METER_AI_COMPLETION=ai.completion
 DODO_METER_CAMPAIGN_RECIPIENT=campaign.recipient
 ```
 
-Dodo webhook path: `POST /api/webhooks/dodo`.
+Dodo webhook path: `POST /api/webhooks/dodo`. Keep this endpoint; do not add a second billing webhook route.
+
+#### Approved billing matrix
+
+Prices below are represented in cents in the API and seed data. Yearly prices are optional but currently seeded and documented here.
+
+| Plan | Monthly | Yearly | Included WhatsApp accounts | Message quotas (`message.sent` / `ai.completion` / `campaign.recipient`) |
+|---|---:|---:|---:|---:|
+| Free | $0 | $0 | 1 | 100 / 0 / 0 |
+| Pro | $29 | $290 | 2 | 5,000 / 1,000 / 5,000 |
+| Business | $99 | $990 | 10 | 25,000 / 10,000 / 25,000 |
+
+Feature flags are seeded as follows:
+
+- Free: all approved flags disabled.
+- Pro: `campaigns`, `ai`, `calling`, `extra_wa_accounts`, and `teams_basic` enabled; the remaining approved flags disabled.
+- Business: all approved flags enabled.
+
+The billing API retains monthly/yearly checkout, `cancel_at_period_end`, seat and WhatsApp-account downgrade blockers, webhook signature tolerance and idempotency, `BillingPayment` and refund events, and plan responses containing prices, extra-seat prices, included WhatsApp accounts, and checkout readiness.
 
 ---
 
