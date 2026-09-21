@@ -36,18 +36,18 @@ PLANS = [
     {
         "key": PLAN_PRO,
         "name": "Pro",
-        "description": "3 seats included, campaigns, AI, calling, usage overage.",
+        "description": "3 seats and 2 WhatsApp accounts included, campaigns, AI, calling, usage overage.",
         "included_seats": 3,
         "display_order": 1,
         "currency": "USD",
-        "price_monthly": 2900,       # TODO: confirm — $29.00
-        "price_yearly": 29000,       # TODO: confirm — $290.00 (2 months free)
+        "price_monthly": 2900,
+        "price_yearly": 29000,
         "product_env": "DODO_PRODUCT_PRO",
         "price_monthly_env": "DODO_PRICE_PRO_MONTHLY",
         "price_yearly_env": "DODO_PRICE_PRO_YEARLY",
         "extra_seat_price_monthly":500,
         "extra_seat_price_yearly":5000,
-        "included_wa_accounts": 3,
+        "included_wa_accounts": 2,
     },
     {
         "key": PLAN_BUSINESS,
@@ -56,14 +56,14 @@ PLANS = [
         "included_seats": 10,
         "display_order": 2,
         "currency": "USD",
-        "price_monthly": 9900,       # TODO: confirm — $99.00
-        "price_yearly": 99000,       # TODO: confirm — $990.00
+        "price_monthly": 9900,
+        "price_yearly": 99000,
         "product_env": "DODO_PRODUCT_BUSINESS",
         "price_monthly_env": "DODO_PRICE_BUSINESS_MONTHLY",
         "price_yearly_env": "DODO_PRICE_BUSINESS_YEARLY",
         "extra_seat_price_monthly": 500,
         "extra_seat_price_yearly": 5000,
-        "included_wa_accounts": 10,  
+        "included_wa_accounts": 10,
     },
 ]
 
@@ -150,10 +150,10 @@ class Command(BaseCommand):
                 FROM custom_roles cr
                 JOIN permissions p ON p.resource = 'settings.billing' AND p.deleted_at IS NULL
                 WHERE cr.is_system = TRUE AND LOWER(cr.name) IN ('admin', 'manager')
-                  AND NOT EXISTS (
+                AND NOT EXISTS (
                     SELECT 1 FROM role_permissions rp
                     WHERE rp.custom_role_id = cr.id AND rp.permission_id = p.id
-                  )
+                )
                 """
             )
         self.stdout.write("  settings.billing permission granted to system admin/manager roles")

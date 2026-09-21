@@ -295,7 +295,10 @@ def update_seats(request):
         return error("Seats can only be changed on an active, non-cancelling subscription", http_status=409)
     used = seats_used(org_id)
     if used > sub.plan.included_seats + extra_seats:
-        return error(f"Cannot reduce seats below active agents ({used})")
+        return error(
+            f"Cannot reduce seats below active agents ({used})",
+            http_status=409,
+        )
 
     try:
         dodo.change_plan(

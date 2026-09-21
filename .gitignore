@@ -45,3 +45,5 @@ celerybeat.pid
 .DS_Store
 Thumbs.db
 Desktop.ini
+# Local tunnel binary (download per developer, never commit)
+cloudflared.exe

@@ -11,11 +11,15 @@ import json
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.test import Client, TestCase, override_settings
+from apps.common.schema import apply_product_schema
+from django.test import Client, SimpleTestCase, TestCase, override_settings
+from django.urls import Resolver404, resolve
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Organization
 from apps.billing.models import (
+    DEFAULT_FEATURES,
+    DEFAULT_QUOTAS,
     PLAN_BUSINESS,
     PLAN_FREE,
     PLAN_PRO,
@@ -28,15 +32,21 @@ from apps.billing.models import (
     OrganizationSubscription,
     PaymentProfile,
 )
+from apps.billing.management.commands.seed_billing import PLANS as SEED_PLANS
 
 BASE = "/api/billing"
-WEBHOOK_URL = f"{BASE}/webhooks/dodo"
-
+WEBHOOK_URL = "/api/webhooks/dodo"
 
 def make_org():
-    # ADJUST: add any other required fields your Organization model has.
-    return Organization.objects.create(name=f"Test Org {uuid4().hex[:6]}")
+    suffix = uuid4().hex[:6]
+    return Organization.objects.create(
+        name=f"Test Org {suffix}",
+        slug=f"test-org-{suffix}",
+    )
 
+
+def setUpModule():
+    apply_product_schema()
 
 class MockUser:
     is_authenticated = True
@@ -77,7 +87,7 @@ class BillingTestBase(TestCase):
         self.pro, _ = BillingPlan.objects.update_or_create(
             key=PLAN_PRO,
             defaults=dict(
-                name="Pro", included_seats=3, included_wa_accounts=3,
+                name="Pro", included_seats=3, included_wa_accounts=2,
                 display_order=1, price_monthly=2900, price_yearly=29000,
                 extra_seat_price_monthly=500, extra_seat_price_yearly=5000,
                 features={"ai": True}, included_quotas={"message.sent": 5000},
@@ -120,7 +130,7 @@ class PlansApiTests(BillingTestBase):
         self.assertEqual(pro["prices"], {"monthly": 2900, "yearly": 29000})
         self.assertEqual(pro["extra_seat_prices"]["monthly"], 500)
         self.assertEqual(pro["included_seats"], 3)
-        self.assertEqual(pro["included_wa_accounts"], 3)
+        self.assertEqual(pro["included_wa_accounts"], 2)
         self.assertEqual(pro["included_quotas"]["message.sent"], 5000)
         self.assertTrue(pro["checkout_ready"]["monthly"])
         self.assertFalse(plans["free"]["checkout_ready"]["monthly"])
@@ -155,7 +165,7 @@ class SubscriptionAndUsageApiTests(BillingTestBase):
 
         self.assertEqual(data["seats"]["used"], 1)
         self.assertEqual(data["seats"]["limit"], 4)
-        self.assertEqual(data["whatsapp_accounts"], {"used": 2, "limit": 3})
+        self.assertEqual(data["whatsapp_accounts"], {"used": 2, "limit": 2})
         meters = {m["meter"] for m in data["meters"]}
         self.assertEqual(
             meters,
@@ -259,7 +269,7 @@ class ChangePlanApiTests(BillingTestBase):
 
     @patch("apps.billing.services.dodo.change_plan")
     def test_downgrade_blocked_by_whatsapp_accounts(self, mocked, _seats, wa):
-        wa.return_value = 5  # Pro allows 3
+        wa.return_value= 5
         self.make_paid_sub(plan=self.business)
         response = self.client.post(f"{BASE}/change-plan", {"plan_key": "pro"}, format="json")
         self.assertEqual(response.status_code, 409)
@@ -296,7 +306,7 @@ class CancelAndSeatsApiTests(BillingTestBase):
 
         sub.refresh_from_db()
         self.assertTrue(sub.cancel_at_period_end)
-        self.assertEqual(sub.plan_id, self.pro.id)  # keeps access until period ends
+        self.assertEqual(sub.plan_id, self.pro.id)
         self.assertEqual(sub.status, STATUS_ACTIVE)
 
     @patch("apps.billing.services.dodo.cancel_subscription")
@@ -343,7 +353,7 @@ class CancelAndSeatsApiTests(BillingTestBase):
 class WebhookTests(BillingTestBase):
     def setUp(self):
         super().setUp()
-        self.anon = Client()  # webhooks are called by Dodo, not a logged-in user
+        self.anon = Client()
 
     def sub_event(self, type_="subscription.active", **data_overrides):
         data = {
@@ -576,3 +586,33 @@ class PaymentProfileTenantTests(BillingTestBase):
         PaymentProfile.objects.create(organization_id=self.other_org.id, **self.data)
         response = self.client.get(f"{BASE}/payment-profile")
         self.assertEqual(response.status_code, 404)
+class ApprovedPlanMatrixTests(SimpleTestCase):
+    """Guards the seeded plan matrix against drift from the approved spec."""
+
+    ALL_FEATURES = (
+        "campaigns", "ai", "calling", "extra_wa_accounts", "teams_basic",
+        "teams_advanced", "custom_roles", "api_keys", "webhooks",
+        "custom_actions", "audit_logs", "sso",
+    )
+    PRO_ON = {"campaigns", "ai", "calling", "extra_wa_accounts", "teams_basic"}
+
+    def test_feature_flags_per_plan(self):
+        for name in self.ALL_FEATURES:
+            self.assertIs(DEFAULT_FEATURES["free"][name], False, name)
+            self.assertIs(DEFAULT_FEATURES["pro"][name], name in self.PRO_ON, name)
+            self.assertIs(DEFAULT_FEATURES["business"][name], True, name)
+
+    def test_seed_specs(self):
+        specs = {p["key"]: p for p in SEED_PLANS}
+        self.assertEqual(
+            {k: (v["price_monthly"], v["included_wa_accounts"]) for k, v in specs.items()},
+            {"free": (0, 1), "pro": (2900, 2), "business": (9900, 10)},
+        )
+        self.assertEqual(DEFAULT_QUOTAS["pro"], {
+            "message.sent": 5000, "ai.completion": 1000, "campaign.recipient": 5000,
+        })
+
+    def test_only_one_dodo_webhook_route(self):
+        self.assertEqual(resolve("/api/webhooks/dodo").func.__name__, "dodo_webhook")
+        with self.assertRaises(Resolver404):
+            resolve("/api/billing/webhooks/dodo")
