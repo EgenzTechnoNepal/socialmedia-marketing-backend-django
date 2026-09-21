@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from django.conf import settings
@@ -41,21 +42,25 @@ def create_checkout_session(
     organization_id: str,
     customer_id: str = "",
     return_url: str = "",
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     client = _client()
     item: dict[str, Any] = {"product_id": product_id, "quantity": 1}
-    if extra_seats and seat_addon_id:
+    if extra_seats:
+        if not seat_addon_id:
+            raise ValueError("seat_addon_id is required when extra_seats > 0")
         item["addons"] = [{"addon_id": seat_addon_id, "quantity": extra_seats}]
     customer: dict[str, Any]
     if customer_id:
         customer = {"customer_id": customer_id}
     else:
         customer = {"email": customer_email, "name": customer_name or customer_email}
+    session_metadata = {**(metadata or {}), "organization_id": organization_id}
     session = client.checkout_sessions.create(
         product_cart=[item],
         customer=customer,
         return_url=return_url or settings.DODO_RETURN_URL,
-        metadata={"organization_id": organization_id},
+        metadata=session_metadata,
     )
     return {
         "session_id": getattr(session, "session_id", None) or getattr(session, "id", ""),
@@ -69,6 +74,7 @@ def change_plan(
     product_id: str,
     extra_seats: int,
     seat_addon_id: str,
+    on_payment_failure: str = "prevent_change",
     proration_billing_mode: str = "prorated_immediately",
 ) -> Any:
     client = _client()
@@ -80,31 +86,28 @@ def change_plan(
         product_id=product_id,
         quantity=1,
         proration_billing_mode=proration_billing_mode,
+        on_payment_failure=on_payment_failure,
         addons=addons,
+        
     )
-
+def cancel_subscription(subscription_id: str) -> Any:
+    """Schedule cancellation at the end of the current billing period."""
+    client = _client()
+    return client.subscriptions.update(subscription_id, cancel_at_next_billing_date=True)
 
 def customer_portal_url(customer_id: str, return_url: str = "") -> str:
     client = _client()
-    customers = getattr(client, "customers", None)
-    if customers is None:
-        raise DodoNotConfigured("SDK has no customers API")
-    for method_name in ("customer_portal", "create_customer_portal", "portal"):
-        method = getattr(customers, method_name, None)
-        if method is None:
-            continue
-        try:
-            result = method(customer_id)
-        except TypeError:
-            result = method(customer_id=customer_id, return_url=return_url or settings.DODO_RETURN_URL)
-        return (
-            getattr(result, "link", None)
-            or getattr(result, "portal_url", None)
-            or getattr(result, "url", None)
-            or str(result)
-        )
-    raise DodoNotConfigured("Could not create a Dodo customer portal session")
-
+    kwargs = {"customer_id": customer_id}
+    if return_url:
+        kwargs["return_url"] = return_url
+    try:
+        session = client.customers.customer_portal.create(**kwargs)
+    except TypeError:
+        session = client.customers.customer_portal.create(customer_id=customer_id)
+    link = getattr(session, "link", "")
+    if not link:
+        raise DodoNotConfigured("Dodo did not return a customer portal link")
+    return link
 
 def list_payments(customer_id: str, limit: int = 20) -> list[dict[str, Any]]:
     client = _client()
@@ -194,6 +197,13 @@ def verify_webhook(payload: bytes, headers: dict[str, str]) -> dict[str, Any]:
     signature = headers.get("webhook-signature") or headers.get("Webhook-Signature") or ""
     if not (msg_id and timestamp and signature):
         raise ValueError("Missing webhook signature headers")
+    try:
+        timestamp_value = int(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid webhook timestamp") from exc
+    tolerance = int(getattr(settings, "DODO_WEBHOOK_TOLERANCE_SECONDS", 300))
+    if abs(time.time() - timestamp_value) > tolerance:
+        raise ValueError("Webhook timestamp is outside the allowed tolerance")
     signed = f"{msg_id}.{timestamp}.".encode() + payload
     key = secret
     if secret.startswith("whsec_"):

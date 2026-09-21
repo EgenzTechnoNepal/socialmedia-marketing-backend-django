@@ -55,11 +55,13 @@ def get_or_create_subscription(organization_id) -> OrganizationSubscription:
         },
     )
     return OrganizationSubscription.objects.create(organization=org, plan=plan, status=STATUS_FREE)
-
-
 def seats_used(organization_id) -> int:
     return User.objects.filter(organization_id=organization_id, is_active=True).count()
 
+def whatsapp_accounts_used(organization_id) -> int:
+    from apps.whatsapp.models import WhatsAppAccount
+
+    return WhatsAppAccount.objects.filter(organization_id=organization_id).count()
 
 def assert_can_add_seat(organization_id) -> OrganizationSubscription:
     sub = get_or_create_subscription(organization_id)
