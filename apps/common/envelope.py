@@ -3,8 +3,12 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 
-from .exceptions import APIError, EntitlementError
-
+from .exceptions import (
+    APIError,
+    EntitlementError,
+    FeatureEntitlementError,
+    QuotaExceededError,
+)
 
 def success(data=None, http_status=status.HTTP_200_OK):
     return Response({"status": "success", "data": data if data is not None else {}}, status=http_status)
@@ -18,8 +22,35 @@ def error(message, http_status=status.HTTP_400_BAD_REQUEST, error_type="", extra
 
 
 def exception_handler(exc, context):
+    if isinstance(exc, FeatureEntitlementError):
+        return error(
+           str(exc),
+           http_status=exc.status_code,
+           error_type=exc.error_type,
+           extra={
+              "feature_key": exc.feature_key,
+               "current_plan": exc.current_plan,
+               "required_plan": exc.required_plan,
+            },
+        )
+
+    if isinstance(exc, QuotaExceededError):
+        return error(
+            str(exc),
+            http_status=exc.status_code,
+            error_type=exc.error_type,
+            extra={
+               "quota": exc.quota,
+               "current_plan": exc.current_plan,
+            },
+        )
+
     if isinstance(exc, EntitlementError):
-        return error(str(exc), http_status=exc.status_code, error_type=exc.error_type)
+        return error(
+            str(exc),
+            http_status=exc.status_code,
+            error_type=exc.error_type,
+        )
     if isinstance(exc, APIError):
         return error(str(exc), http_status=exc.status_code, error_type=exc.error_type)
 

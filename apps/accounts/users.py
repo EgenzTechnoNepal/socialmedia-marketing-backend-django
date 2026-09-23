@@ -1,11 +1,12 @@
 import bcrypt
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone as dj_tz
 from rest_framework.decorators import api_view, permission_classes
 
 from apps.accounts.models import CustomRole, Organization, User, UserOrganization
 from apps.accounts.payloads import apply_org_role, user_to_response
-from apps.billing.entitlements import assert_can_add_seat
+from apps.billing.entitlements import assert_can_add_seat, lock_organization
 from apps.common.envelope import error, success
 from apps.common.exceptions import APIError
 from apps.common.http import is_super, list_payload, org_id, parse_pagination, require_perm
@@ -55,7 +56,6 @@ def users_collection(request):
         return success(payload)
 
     require_perm(request, "users", "write")
-    assert_can_add_seat(oid)
     data = request.data if isinstance(request.data, dict) else {}
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
@@ -69,26 +69,54 @@ def users_collection(request):
             or CustomRole.objects.filter(organization_id=oid, name="agent", is_system=True).first()
         )
         role_id = role.id if role else None
-    existing = User.objects.filter(email=email).first()
-    if existing:
-        if UserOrganization.objects.filter(user=existing, organization_id=oid).exists():
-            return error("User already belongs to this organization", http_status=409)
-        UserOrganization.objects.create(user=existing, organization_id=oid, role_id=role_id, is_default=False)
-        return success(_user_payload(existing, oid), http_status=201)
-    org = Organization.objects.get(id=oid)
-    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
-    is_super_admin = bool(data.get("is_super_admin")) if is_super(request) else False
-    user = User.objects.create(
-        organization=org,
-        email=email,
-        password_hash=password_hash,
-        full_name=full_name,
-        role_id=role_id,
-        is_active=True,
-        is_super_admin=is_super_admin,
-    )
-    UserOrganization.objects.create(user=user, organization=org, role_id=role_id, is_default=True)
-    return success(_user_payload(user, oid), http_status=201)
+    with transaction.atomic():
+       lock_organization(oid)
+       assert_can_add_seat(oid)
+
+       existing = User.objects.filter(email=email).first()
+       if existing:
+            if UserOrganization.objects.filter(
+             user=existing,
+             organization_id=oid,
+          ).exists():
+              return error(
+                 "User already belongs to this organization",
+                  http_status=409,
+                )
+
+            UserOrganization.objects.create(
+              user=existing,
+              organization_id=oid,
+              role_id=role_id,
+              is_default=False,
+            )
+            return success(_user_payload(existing, oid), http_status=201)
+
+       org = Organization.objects.get(id=oid)
+       password_hash = bcrypt.hashpw(
+          password.encode("utf-8"),
+          bcrypt.gensalt(rounds=10),
+        ).decode("utf-8")
+       is_super_admin = bool(data.get("is_super_admin")) if is_super(request) else False
+
+       user = User.objects.create(
+          organization=org,
+          email=email,
+          password_hash=password_hash,
+          full_name=full_name,
+          role_id=role_id,
+          is_active=True,
+          is_super_admin=is_super_admin,
+        )
+
+       UserOrganization.objects.create(
+          user=user,
+          organization=org,
+          role_id=role_id,
+          is_default=True,
+        )
+
+       return success(_user_payload(user, oid), http_status=201)
 
 
 @api_view(["GET", "PUT", "DELETE"])

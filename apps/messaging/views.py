@@ -10,7 +10,7 @@ from django.utils import timezone as dj_tz
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 
-from apps.billing.entitlements import METER_MESSAGE_SENT, assert_outbound_allowed, record_usage
+from apps.billing.entitlements import( METER_MESSAGE_SENT, assert_outbound_allowed, assert_quota_available, record_usage)
 from apps.common.envelope import error, success
 from apps.common.exceptions import APIError
 from apps.common.http import iso, list_payload, org_id, parse_pagination, require_perm
@@ -172,6 +172,7 @@ def _mark_read(oid, contact: Contact):
 def _send_text_or_interactive(request, contact: Contact, data: dict):
     oid = org_id(request)
     assert_outbound_allowed(oid)
+    assert_quota_available(oid, METER_MESSAGE_SENT)
     account = resolve_account(oid, data.get("whatsapp_account") or "", contact)
     msg_type = data.get("type") or "text"
     content_obj = data.get("content") or {}
@@ -260,6 +261,7 @@ def send_media(request):
     oid = org_id(request)
     require_perm(request, "chat", "write")
     assert_outbound_allowed(oid)
+    assert_quota_available(oid, METER_MESSAGE_SENT)
     contact_id = request.data.get("contact_id")
     contact = _get_contact(request, contact_id)
     upload = request.FILES.get("file")
@@ -309,6 +311,7 @@ def send_template(request):
     oid = org_id(request)
     require_perm(request, "chat", "write")
     assert_outbound_allowed(oid)
+    assert_quota_available(oid, METER_MESSAGE_SENT)
     data = request.data if isinstance(request.data, dict) else {}
     contact = None
     if data.get("contact_id"):

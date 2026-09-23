@@ -2,7 +2,11 @@ import logging
 
 from django.utils import timezone as dj_tz
 
-from apps.billing.entitlements import METER_MESSAGE_SENT, record_usage
+from apps.billing.entitlements import (
+    METER_MESSAGE_SENT,
+    assert_quota_available,
+    record_usage,
+)
 from apps.contacts.models import Contact
 from apps.messaging.models import Message
 from apps.messaging.views import _preview, _touch_contact
@@ -93,6 +97,10 @@ def _persist_and_send(
     media_mime="",
     event="message.outgoing",
 ) -> Message:
+    assert_quota_available(
+        account.organization_id,
+        METER_MESSAGE_SENT,
+    )
     msg = Message.objects.create(
         organization_id=account.organization_id,
         whatsapp_account=account.name,

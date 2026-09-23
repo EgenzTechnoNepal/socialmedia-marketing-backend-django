@@ -8,13 +8,14 @@ from pathlib import Path
 
 from django.conf import settings as dj_settings
 from django.http import FileResponse
+from django.db import transaction
 from django.utils import timezone as dj_tz
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 
 from apps.accounts.models import CustomRole, Organization, User, UserOrganization
 from apps.accounts.roles import seed_system_roles
-from apps.billing.entitlements import assert_can_add_seat
+from apps.billing.entitlements import assert_can_add_seat, lock_organization
 from apps.common.envelope import error, success
 from apps.common.http import is_super, org_id, require_perm, user_iso
 from apps.common.permissions import CookieAuthenticated
@@ -172,25 +173,46 @@ def members_collection(request):
         return success({"members": payload})
 
     require_perm(request, "organizations", "assign")
-    assert_can_add_seat(oid)
     data = request.data if isinstance(request.data, dict) else {}
-    user = None
-    if data.get("user_id"):
-        user = User.objects.filter(id=data["user_id"]).first()
-    elif data.get("email"):
-        user = User.objects.filter(email=data["email"].strip()).first()
-    if not user:
-        return error("User not found", http_status=404)
-    if UserOrganization.objects.filter(user=user, organization_id=oid).exists():
-        return error("You are already a member of this organization", http_status=409)
-    role_id = data.get("role_id")
-    if not role_id:
-        role = CustomRole.objects.filter(organization_id=oid, is_default=True).first()
-        role_id = role.id if role else None
-    m = UserOrganization.objects.create(
-        user=user, organization_id=oid, role_id=role_id, is_default=False
-    )
-    return success(_member_payload(m, user), http_status=201)
+
+    with transaction.atomic():
+        lock_organization(oid)
+        assert_can_add_seat(oid)
+
+        user = None
+        if data.get("user_id"):
+            user = User.objects.filter(id=data["user_id"]).first()
+        elif data.get("email"):
+            user = User.objects.filter(email=data["email"].strip()).first()
+
+        if not user:
+            return error("User not found", http_status=404)
+
+        if UserOrganization.objects.filter(
+            user=user,
+            organization_id=oid,
+        ).exists():
+            return error(
+                "You are already a member of this organization",
+                http_status=409,
+            )
+
+        role_id = data.get("role_id")
+        if not role_id:
+            role = CustomRole.objects.filter(
+                organization_id=oid,
+                is_default=True,
+            ).first()
+            role_id = role.id if role else None
+
+        m = UserOrganization.objects.create(
+            user=user,
+            organization_id=oid,
+            role_id=role_id,
+            is_default=False,
+        )
+
+        return success(_member_payload(m, user), http_status=201)
 
 
 @api_view(["PUT", "DELETE"])

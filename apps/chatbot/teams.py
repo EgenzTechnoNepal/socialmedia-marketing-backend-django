@@ -2,6 +2,7 @@ from django.db.models import Q
 from rest_framework.decorators import api_view, permission_classes
 
 from apps.accounts.models import User
+from apps.billing.entitlements import FEATURE_TEAMS_BASIC, assert_feature
 from apps.chatbot.models import Team, TeamMember
 from apps.common.envelope import error, success
 from apps.common.http import iso, list_payload, org_id, parse_pagination, request_body, require_perm, soft_delete
@@ -53,6 +54,7 @@ def _user_team_ids(user_id):
 @permission_classes([CookieAuthenticated])
 def teams_collection(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_TEAMS_BASIC)
     if request.method == "GET":
         page, limit, offset = parse_pagination(request)
         qs = Team.objects.filter(organization_id=oid).prefetch_related("members", "members__user").select_related("created_by", "updated_by")
@@ -89,6 +91,7 @@ def teams_collection(request):
 @permission_classes([CookieAuthenticated])
 def team_detail(request, team_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_TEAMS_BASIC)
     team = (
         Team.objects.filter(id=team_id, organization_id=oid)
         .select_related("created_by", "updated_by")
@@ -130,6 +133,7 @@ def team_detail(request, team_id):
 @permission_classes([CookieAuthenticated])
 def team_members(request, team_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_TEAMS_BASIC)
     team = Team.objects.filter(id=team_id, organization_id=oid).first()
     if not team:
         return error("Team not found", http_status=404)
@@ -155,6 +159,7 @@ def team_members(request, team_id):
 @permission_classes([CookieAuthenticated])
 def team_member_detail(request, team_id, member_user_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_TEAMS_BASIC)
     team = Team.objects.filter(id=team_id, organization_id=oid).first()
     if not team:
         return error("Team not found", http_status=404)
