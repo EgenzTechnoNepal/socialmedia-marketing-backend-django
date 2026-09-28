@@ -7,6 +7,7 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import AllowAny
 
 from apps.accounts.models import CustomRole, Permission, UserOrganization
+from apps.billing.entitlements import FEATURE_CUSTOM_ROLES, assert_feature
 from apps.common.envelope import error, success
 from apps.common.http import list_payload, org_id, parse_pagination, user_iso
 from apps.common.permissions import CookieAuthenticated
@@ -73,7 +74,7 @@ def roles_collection(request):
         total = qs.count()
         roles = list(qs.order_by("name")[offset : offset + limit])
         return success(list_payload("roles", [_role_payload(r) for r in roles], total, page, limit))
-
+    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     data = request.data if isinstance(request.data, dict) else {}
     name = (data.get("name") or "").strip()
     if not name:
@@ -101,6 +102,7 @@ def role_detail(request, role_id):
         return error("Role not found", http_status=404)
     if request.method == "GET":
         return success(_role_payload(role))
+    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     if request.method == "DELETE":
         if role.is_system:
             return error("System roles cannot be deleted", http_status=400)

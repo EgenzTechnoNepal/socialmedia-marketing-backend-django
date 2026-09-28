@@ -6,12 +6,18 @@ import urllib.request
 from datetime import datetime, timezone
 
 from django.conf import settings
-from django.db import DatabaseError
+from django.db import DatabaseError, transaction
 from django.http import HttpResponseRedirect
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny
 
 from apps.accounts.models import CustomRole, SSOProvider, User, UserOrganization
+from apps.billing.entitlements import (
+    FEATURE_SSO,
+    assert_can_add_seat,
+    assert_feature,
+    lock_organization,
+)
 from apps.accounts.payloads import apply_org_role
 from apps.common.cookies import set_auth_cookies
 from apps.common.envelope import error, success
@@ -144,6 +150,7 @@ def init_sso(request, provider):
     row = SSOProvider.objects.filter(provider=provider, is_enabled=True).first()
     if not row:
         return error("SSO provider not configured or disabled", http_status=404)
+    assert_feature(row.organization_id, FEATURE_SSO)
     nonce = secrets.token_urlsafe(24)
     state = {
         "org_id": str(row.organization_id),
@@ -224,6 +231,7 @@ def callback_sso(request, provider):
     if state.get("provider") != provider or datetime.now(timezone.utc).timestamp() > float(state.get("expires_at") or 0):
         return _redirect_error("Invalid or expired state")
     org_uuid = state.get("org_id")
+    assert_feature(org_uuid, FEATURE_SSO)
     row = SSOProvider.objects.filter(organization_id=org_uuid, provider=provider).first()
     if not row:
         return _redirect_error("SSO provider not configured")
@@ -264,20 +272,24 @@ def callback_sso(request, provider):
         role = CustomRole.objects.filter(organization_id=org_uuid, name=role_name).first()
         if not role:
             return _redirect_error("Failed to create user account: role not found")
-        user = User.objects.create(
-            organization_id=org_uuid,
-            email=email,
-            full_name=name or "",
-            password_hash="",
-            role_id=role.id,
-            is_active=True,
-            is_available=True,
-            sso_provider=provider,
-            sso_provider_id=provider_id,
-        )
-        UserOrganization.objects.create(
-            user=user, organization_id=org_uuid, role_id=role.id, is_default=True
-        )
+        with transaction.atomic():
+            lock_organization(org_uuid)
+            assert_can_add_seat(org_uuid)
+            user = User.objects.create(
+                organization_id=org_uuid,
+                email=email,
+                full_name=name or "",
+                password_hash="",
+                role_id=role.id,
+                is_active=True,
+                is_available=True,
+                sso_provider=provider,
+                sso_provider_id=provider_id,
+            )
+            UserOrganization.objects.create(
+                user=user, organization_id=org_uuid, role_id=role.id, is_default=True
+            )
+
     else:
         if not user.is_active:
             return _redirect_error("Account is disabled")
@@ -296,6 +308,7 @@ def callback_sso(request, provider):
 @permission_classes([CookieAuthenticated])
 def sso_settings(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_SSO)
     require_perm(request, "settings.sso", "read")
     rows = SSOProvider.objects.filter(organization_id=oid)
     return success([_provider_payload(r) for r in rows])
@@ -305,6 +318,7 @@ def sso_settings(request):
 @permission_classes([CookieAuthenticated])
 def sso_provider_detail(request, provider):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_SSO)
     if provider not in VALID_PROVIDERS:
         return error("Invalid provider", http_status=400)
     if request.method == "DELETE":

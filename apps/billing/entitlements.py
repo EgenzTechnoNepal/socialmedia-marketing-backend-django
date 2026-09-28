@@ -5,7 +5,11 @@ from django.db.models import F
 from django.utils import timezone as dj_tz
 
 from apps.accounts.models import Organization, User
-from apps.common.exceptions import EntitlementError
+from apps.common.exceptions import (
+    EntitlementError,
+    FeatureEntitlementError,
+    QuotaExceededError,
+)
 
 from .models import (
     DEFAULT_FEATURES,
@@ -25,6 +29,14 @@ FEATURE_CAMPAIGNS = "campaigns"
 FEATURE_AI = "ai"
 FEATURE_CALLING = "calling"
 FEATURE_EXTRA_WA = "extra_wa_accounts"
+FEATURE_TEAMS_BASIC = "teams_basic"
+FEATURE_TEAMS_ADVANCED = "teams_advanced"
+FEATURE_CUSTOM_ROLES = "custom_roles"
+FEATURE_API_KEYS = "api_keys"
+FEATURE_WEBHOOKS = "webhooks"
+FEATURE_CUSTOM_ACTIONS = "custom_actions"
+FEATURE_AUDIT_LOGS = "audit_logs"
+FEATURE_SSO = "sso"
 
 METER_ALIASES = {
     METER_MESSAGE_SENT: METER_MESSAGE_SENT,
@@ -63,6 +75,29 @@ def whatsapp_accounts_used(organization_id) -> int:
 
     return WhatsAppAccount.objects.filter(organization_id=organization_id).count()
 
+
+def assert_can_add_whatsapp_account(organization_id) -> OrganizationSubscription:
+    sub = get_or_create_subscription(organization_id)
+
+    if not sub.is_usable:
+        raise EntitlementError(
+            "Subscription is not active. Update billing to add WhatsApp accounts."
+        )
+
+    used = whatsapp_accounts_used(organization_id)
+    limit = int(sub.plan.included_wa_accounts)
+
+    if used >= limit:
+        raise EntitlementError(
+            f"WhatsApp account limit reached ({used}/{limit}). Upgrade your plan to add more WhatsApp accounts."
+        )
+
+    return sub
+
+def lock_organization(organization_id) -> Organization:
+    return Organization.objects.select_for_update().get(id=organization_id)
+
+
 def assert_can_add_seat(organization_id) -> OrganizationSubscription:
     sub = get_or_create_subscription(organization_id)
     if not sub.is_usable:
@@ -77,10 +112,29 @@ def assert_can_add_seat(organization_id) -> OrganizationSubscription:
 
 def assert_feature(organization_id, feature: str) -> OrganizationSubscription:
     sub = get_or_create_subscription(organization_id)
+
     if not sub.is_usable and feature != "chat_read":
-        raise EntitlementError("Subscription is on hold or cancelled. Outbound features are disabled.")
+        raise EntitlementError(
+            "Subscription is on hold or cancelled. Outbound features are disabled."
+        )
+
     if not sub.feature_enabled(feature):
-        raise EntitlementError(f"Your {sub.plan.name} plan does not include {feature}. Upgrade in Billing.")
+        required_plan = next(
+            (
+                plan_key
+                for plan_key in (PLAN_FREE, "pro", "business")
+                if DEFAULT_FEATURES.get(plan_key, {}).get(feature) is True
+            ),
+            "paid",
+        )
+
+        raise FeatureEntitlementError(
+            f"Your {sub.plan.name} plan does not include {feature}. Upgrade in Billing.",
+            feature_key=feature,
+            current_plan=sub.plan.key,
+            required_plan=required_plan,
+        )
+
     return sub
 
 
@@ -104,6 +158,46 @@ def current_usage(organization_id, meter: str) -> int:
     return int(row.quantity) if row else 0
 
 
+def assert_quota_available(
+    organization_id,
+    meter: str,
+    *,
+    quantity: int = 1,
+) -> OrganizationSubscription:
+    """Check a hard-capped quota without consuming usage."""
+    meter = METER_ALIASES.get(meter, meter)
+    sub = get_or_create_subscription(organization_id)
+
+    if not sub.is_usable:
+        raise EntitlementError("Subscription is not active.")
+
+    included = quota_for(sub, meter)
+    features = sub.plan.features or DEFAULT_FEATURES.get(sub.plan.key, {})
+    hard_cap = bool(features.get("hard_cap_usage"))
+
+    if not hard_cap:
+        return sub
+
+    start = period_start()
+
+    with transaction.atomic():
+        counter, _ = UsageCounter.objects.select_for_update().get_or_create(
+            organization_id=organization_id,
+            meter=meter,
+            period_start=start,
+            defaults={"quantity": 0},
+        )
+
+        if included >= 0 and counter.quantity + quantity > included:
+            raise QuotaExceededError(
+                f"Included {meter} quota reached ({counter.quantity}/{included}) for this period.",
+                quota=meter,
+                current_plan=sub.plan.key,
+            )
+
+    return sub
+
+
 def record_usage(organization_id, meter: str, *, event_id: str, quantity: int = 1, metadata=None) -> int:
     """Increment local counter, optionally hard-cap free plans, enqueue Dodo ingest."""
     meter = METER_ALIASES.get(meter, meter)
@@ -124,8 +218,10 @@ def record_usage(organization_id, meter: str, *, event_id: str, quantity: int = 
             defaults={"quantity": 0},
         )
         if hard_cap and included >= 0 and counter.quantity + quantity > included:
-            raise EntitlementError(
-                f"Included {meter} quota reached ({counter.quantity}/{included}) for this period."
+            raise QuotaExceededError(
+                f"Included {meter} quota reached ({counter.quantity}/{included}) for this period.",
+                quota=meter,
+                current_plan=sub.plan.key,
             )
         UsageCounter.objects.filter(pk=counter.pk).update(quantity=F("quantity") + quantity)
         counter.refresh_from_db()

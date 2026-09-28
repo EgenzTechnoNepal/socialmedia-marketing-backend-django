@@ -1,6 +1,7 @@
 from rest_framework.decorators import api_view, permission_classes
 
 from apps.accounts.models import AuditLog
+from apps.billing.entitlements import FEATURE_AUDIT_LOGS, assert_feature
 from apps.common.envelope import error, success
 from apps.common.http import iso, org_id, parse_pagination, require_perm
 from apps.common.permissions import CookieAuthenticated
@@ -23,6 +24,7 @@ def _log_payload(row: AuditLog):
 @permission_classes([CookieAuthenticated])
 def audit_logs_collection(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_AUDIT_LOGS)
     require_perm(request, "audit_logs", "read")
     page, limit, offset = parse_pagination(request)
     qs = AuditLog.objects.filter(organization_id=oid)
@@ -47,6 +49,7 @@ def audit_logs_collection(request):
 @permission_classes([CookieAuthenticated])
 def audit_log_detail(request, log_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_AUDIT_LOGS)
     require_perm(request, "audit_logs", "read")
     try:
         row = AuditLog.objects.get(id=log_id, organization_id=oid)

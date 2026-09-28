@@ -5,7 +5,13 @@ import urllib.request
 
 from django.conf import settings
 
-from apps.billing.entitlements import FEATURE_AI, METER_AI_COMPLETION, assert_feature, record_usage
+from apps.billing.entitlements import (
+    FEATURE_AI,
+    METER_AI_COMPLETION,
+    assert_feature,
+    assert_quota_available,
+    record_usage,
+)
 from apps.chatbot.models import AIContext, ChatbotSessionMessage
 from services.crypto import decrypt
 from services.templates import process_template
@@ -19,6 +25,10 @@ def decrypt_ai_key(raw: str) -> str:
 
 def generate_ai_response(chatbot_settings, session, user_message: str) -> str:
     assert_feature(chatbot_settings.organization_id, FEATURE_AI)
+    assert_quota_available(
+        chatbot_settings.organization_id,
+        METER_AI_COMPLETION,
+    )
     context_data = build_ai_context(chatbot_settings.organization_id, session, user_message)
     provider = (chatbot_settings.ai_provider or "").lower()
     api_key = decrypt_ai_key(chatbot_settings.ai_api_key)

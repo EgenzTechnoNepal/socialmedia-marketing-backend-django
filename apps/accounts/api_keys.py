@@ -5,6 +5,7 @@ from django.utils import timezone as dj_tz
 from rest_framework.decorators import api_view, permission_classes
 
 from apps.accounts.models import APIKey
+from apps.billing.entitlements import FEATURE_API_KEYS, assert_feature
 from apps.common.envelope import error, success
 from apps.common.http import iso, org_id, parse_pagination, require_perm
 from apps.common.permissions import CookieAuthenticated
@@ -29,6 +30,7 @@ def _key_payload(key: APIKey, *, include_secret=None):
 @permission_classes([CookieAuthenticated])
 def api_keys_collection(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_API_KEYS)
     if request.method == "GET":
         require_perm(request, "api_keys", "read")
         page, limit, offset = parse_pagination(request)
@@ -67,6 +69,7 @@ def api_keys_collection(request):
 @permission_classes([CookieAuthenticated])
 def api_key_detail(request, key_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_API_KEYS)
     try:
         key = APIKey.objects.get(id=key_id, organization_id=oid)
     except APIKey.DoesNotExist:

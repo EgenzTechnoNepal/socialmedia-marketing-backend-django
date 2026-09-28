@@ -4,7 +4,15 @@ from datetime import datetime
 from django.db.models import F
 from django.utils import timezone as dj_tz
 
-from apps.billing.entitlements import FEATURE_CAMPAIGNS, METER_CAMPAIGN_RECIPIENT, METER_MESSAGE_SENT, assert_feature, record_usage
+from apps.billing.entitlements import (
+    FEATURE_CAMPAIGNS,
+    METER_CAMPAIGN_RECIPIENT,
+    METER_MESSAGE_SENT,
+    assert_feature,
+    assert_quota_available,
+    record_usage,
+)
+from apps.common.exceptions import QuotaExceededError
 from apps.campaigns.models import BulkMessageCampaign, BulkMessageRecipient
 from apps.contacts.views import get_or_create_contact
 from apps.messaging.models import Message
@@ -93,11 +101,28 @@ def send_campaign_recipient(campaign_id: str, recipient_id: str):
     wamid = ""
     err = ""
     try:
+        assert_quota_available(
+            campaign.organization_id,
+            METER_CAMPAIGN_RECIPIENT,
+        )
+        assert_quota_available(
+            campaign.organization_id,
+            METER_MESSAGE_SENT,
+        )
         wamid = whatsapp_client.send_template(
             account, recipient.phone_number, template.name, template.language, components
         )
         record_usage(campaign.organization_id, METER_CAMPAIGN_RECIPIENT, event_id=f"campaign-rcpt:{recipient.id}")
         record_usage(campaign.organization_id, METER_MESSAGE_SENT, event_id=f"campaign-msg:{recipient.id}")
+    except QuotaExceededError as exc:
+        recipient.status = "failed"
+        recipient.error_message = str(exc)
+        recipient.save(update_fields=["status", "error_message", "updated_at"])
+        BulkMessageCampaign.objects.filter(id=campaign.id).update(
+            failed_count=F("failed_count") + 1
+        )
+        _maybe_complete(campaign)
+        return
     except WhatsAppError as exc:
         err = str(exc)
     msg = Message.objects.create(

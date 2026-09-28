@@ -1,12 +1,16 @@
 from rest_framework.decorators import api_view, permission_classes
 
-from apps.billing.entitlements import FEATURE_EXTRA_WA, assert_feature, get_or_create_subscription
+from apps.billing.entitlements import (
+    FEATURE_EXTRA_WA,
+    assert_can_add_whatsapp_account,
+    assert_feature,
+)
 from apps.common.envelope import error
 from apps.common.permissions import CookieAuthenticated, request_organization_id
 
 
 def before_create_account(organization_id, existing_count: int):
-    sub = get_or_create_subscription(organization_id)
+    sub = assert_can_add_whatsapp_account(organization_id)
     if existing_count >= 1:
         assert_feature(organization_id, FEATURE_EXTRA_WA)
     return sub

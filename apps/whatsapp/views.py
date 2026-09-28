@@ -1,9 +1,16 @@
 from django.conf import settings
+from django.db import transaction
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 
 from apps.accounts.models import Organization
-from apps.billing.entitlements import FEATURE_EXTRA_WA, assert_feature, get_or_create_subscription
+from apps.billing.entitlements import (
+    FEATURE_EXTRA_WA,
+    assert_can_add_whatsapp_account,
+    assert_feature,
+    get_or_create_subscription,
+    lock_organization,
+)
 from apps.common.envelope import error, success
 from apps.common.http import iso, org_id, require_perm
 from apps.common.permissions import CookieAuthenticated
@@ -59,43 +66,57 @@ def accounts_collection(request):
         require_perm(request, "accounts", "read")
         accounts = WhatsAppAccount.objects.filter(organization_id=oid).order_by("name")
         return success({"accounts": [_account_payload(a) for a in accounts]})
-
     require_perm(request, "accounts", "write")
-    existing = WhatsAppAccount.objects.filter(organization_id=oid).count()
-    get_or_create_subscription(oid)
-    if existing >= 1:
-        assert_feature(oid, FEATURE_EXTRA_WA)
-    data = request.data if isinstance(request.data, dict) else {}
-    name = (data.get("name") or "").strip()
-    phone_id = (data.get("phone_id") or "").strip()
-    business_id = (data.get("business_id") or "").strip()
-    access_token = data.get("access_token") or ""
-    if not name or not phone_id or not business_id or not access_token:
-        return error("name, phone_id, business_id, and access_token are required", http_status=400)
-    if data.get("is_default_incoming"):
-        _clear_defaults(oid, incoming=True)
-    if data.get("is_default_outgoing"):
-        _clear_defaults(oid, outgoing=True)
-    account = WhatsAppAccount(
-        organization_id=oid,
-        name=name,
-        app_id=data.get("app_id") or "",
-        phone_id=phone_id,
-        business_id=business_id,
-        access_token=access_token,
-        app_secret=data.get("app_secret") or "",
-        webhook_verify_token=data.get("webhook_verify_token") or "",
-        api_version=data.get("api_version") or "v21.0",
-        is_default_incoming=bool(data.get("is_default_incoming")),
-        is_default_outgoing=bool(data.get("is_default_outgoing")),
-        auto_read_receipt=bool(data.get("auto_read_receipt")),
-        business_calling_enabled=bool(data.get("business_calling_enabled")),
-        created_by=request.user,
-        updated_by=request.user,
-    )
-    account.encrypt_secrets()
-    account.save()
-    return success(_account_payload(account), http_status=201)
+
+    with transaction.atomic():
+        lock_organization(oid)
+
+        existing = WhatsAppAccount.objects.filter(organization_id=oid).count()
+        assert_can_add_whatsapp_account(oid)
+
+        if existing >= 1:
+            assert_feature(oid, FEATURE_EXTRA_WA)
+
+        data = request.data if isinstance(request.data, dict) else {}
+        name = (data.get("name") or "").strip()
+        phone_id = (data.get("phone_id") or "").strip()
+        business_id = (data.get("business_id") or "").strip()
+        access_token = data.get("access_token") or ""
+
+        if not name or not phone_id or not business_id or not access_token:
+            return error(
+                "name, phone_id, business_id, and access_token are required",
+                http_status=400,
+            )
+
+        if data.get("is_default_incoming"):
+            _clear_defaults(oid, incoming=True)
+
+        if data.get("is_default_outgoing"):
+            _clear_defaults(oid, outgoing=True)
+
+        account = WhatsAppAccount(
+            organization_id=oid,
+            name=name,
+            app_id=data.get("app_id") or "",
+            phone_id=phone_id,
+            business_id=business_id,
+            access_token=access_token,
+            app_secret=data.get("app_secret") or "",
+            webhook_verify_token=data.get("webhook_verify_token") or "",
+            api_version=data.get("api_version") or "v21.0",
+            is_default_incoming=bool(data.get("is_default_incoming")),
+            is_default_outgoing=bool(data.get("is_default_outgoing")),
+            auto_read_receipt=bool(data.get("auto_read_receipt")),
+            business_calling_enabled=bool(data.get("business_calling_enabled")),
+            created_by=request.user,
+            updated_by=request.user,
+        )
+
+        account.encrypt_secrets()
+        account.save()
+
+        return success(_account_payload(account), http_status=201)
 
 
 @api_view(["GET", "PUT", "DELETE"])
@@ -235,46 +256,64 @@ def exchange_token(request):
         return error(str(exc), http_status=400)
     if not phone_id or not waba_id:
         return error("Could not resolve phone_id and waba_id", http_status=400)
-    existing = WhatsAppAccount.all_objects.filter(organization_id=oid, phone_id=phone_id).first()
-    get_or_create_subscription(oid)
-    if existing is None and WhatsAppAccount.objects.filter(organization_id=oid).count() >= 1:
-        assert_feature(oid, FEATURE_EXTRA_WA)
     if not name:
         try:
-            info = whatsapp_client.phone_number_info(phone_id, access_token, api_version)
+            info = whatsapp_client.phone_number_info(
+                phone_id,
+                access_token,
+                api_version,
+            )
             name = f"{info.get('verified_name') or 'WhatsApp'} ({info.get('display_phone_number') or phone_id})"
         except WhatsAppError:
             name = f"WhatsApp {phone_id[-6:]}"
-    if existing:
-        account = existing
-        account.deleted_at = None
-        account.access_token = access_token
-        account.business_id = waba_id
-        account.app_id = app_id
-        account.app_secret = app_secret
-        account.name = name or account.name
-        if data.get("webhook_verify_token"):
-            account.webhook_verify_token = data["webhook_verify_token"]
-        account.status = "active"
-        account.updated_by = request.user
-    else:
-        account = WhatsAppAccount(
+    with transaction.atomic():
+        lock_organization(oid)
+
+        existing = WhatsAppAccount.all_objects.filter(
             organization_id=oid,
-            name=name,
-            app_id=app_id,
             phone_id=phone_id,
-            business_id=waba_id,
-            access_token=access_token,
-            app_secret=app_secret,
-            webhook_verify_token=data.get("webhook_verify_token") or "",
-            api_version=api_version,
-            status="active",
-            created_by=request.user,
-            updated_by=request.user,
-        )
-    account.encrypt_secrets()
-    account.save()
-    account.decrypt_secrets()
+        ).first()
+
+        if existing is None:
+            assert_can_add_whatsapp_account(oid)
+            if WhatsAppAccount.objects.filter(
+                organization_id=oid
+            ).count() >= 1:
+                assert_feature(oid, FEATURE_EXTRA_WA)
+
+        if existing:
+            account = existing
+            account.deleted_at = None
+            account.access_token = access_token
+            account.business_id = waba_id
+            account.app_id = app_id
+            account.app_secret = app_secret
+            account.name = name or account.name
+
+            if data.get("webhook_verify_token"):
+                account.webhook_verify_token = data["webhook_verify_token"]
+
+            account.status = "active"
+            account.updated_by = request.user
+        else:
+            account = WhatsAppAccount(
+                organization_id=oid,
+                name=name,
+                app_id=app_id,
+                phone_id=phone_id,
+                business_id=waba_id,
+                access_token=access_token,
+                app_secret=app_secret,
+                webhook_verify_token=data.get("webhook_verify_token") or "",
+                api_version=api_version,
+                status="active",
+                created_by=request.user,
+                updated_by=request.user,
+            )
+
+        account.encrypt_secrets()
+        account.save()
+        account.decrypt_secrets()
     warning = ""
     try:
         whatsapp_client.subscribe_waba(account)

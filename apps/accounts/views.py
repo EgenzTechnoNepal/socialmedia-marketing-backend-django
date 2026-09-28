@@ -16,6 +16,7 @@ from apps.common.cookies import (
 )
 from apps.common.envelope import error, success
 from apps.common.permissions import CookieAuthenticated
+from apps.billing.entitlements import assert_can_add_seat, lock_organization
 from apps.common.tokens import (
     DUMMY_BCRYPT,
     consume_refresh_jti,
@@ -146,6 +147,8 @@ def register(request):
     password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
     try:
         with transaction.atomic():
+            lock_organization(org.id)
+            assert_can_add_seat(org.id)
             user = User.objects.create(
                 organization=org,
                 email=email,

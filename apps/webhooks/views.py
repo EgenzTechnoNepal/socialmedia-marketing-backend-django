@@ -14,6 +14,11 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import AllowAny
 
 from apps.accounts.models import Organization
+from apps.billing.entitlements import (
+    FEATURE_CUSTOM_ACTIONS,
+    FEATURE_WEBHOOKS,
+    assert_feature,
+)
 from apps.common.envelope import error, success
 from apps.common.http import iso, list_payload, org_id, parse_pagination, request_body, require_perm, soft_delete
 from apps.common.permissions import CookieAuthenticated
@@ -71,6 +76,7 @@ def webhook_payload(row: Webhook) -> dict:
 @permission_classes([CookieAuthenticated])
 def webhooks_collection(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_WEBHOOKS)
     if request.method == "GET":
         require_perm(request, "webhooks", "read")
         page, limit, offset = parse_pagination(request)
@@ -110,6 +116,7 @@ def webhooks_collection(request):
 @permission_classes([CookieAuthenticated])
 def webhook_detail(request, webhook_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_WEBHOOKS)
     row = Webhook.objects.filter(id=webhook_id, organization_id=oid).first()
     if not row:
         return error("Webhook not found", http_status=404)
@@ -145,6 +152,7 @@ def webhook_detail(request, webhook_id):
 @permission_classes([CookieAuthenticated])
 def test_webhook(request, webhook_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_WEBHOOKS)
     require_perm(request, "webhooks", "write")
     row = Webhook.objects.filter(id=webhook_id, organization_id=oid).first()
     if not row:
@@ -192,6 +200,7 @@ def _validate_action(action_type: str, config: dict) -> str:
 @permission_classes([CookieAuthenticated])
 def custom_actions_collection(request):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_CUSTOM_ACTIONS)
     if request.method == "GET":
         page, limit, offset = parse_pagination(request)
         qs = CustomAction.objects.filter(organization_id=oid)
@@ -226,6 +235,7 @@ def custom_actions_collection(request):
 @permission_classes([CookieAuthenticated])
 def custom_action_detail(request, action_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_CUSTOM_ACTIONS)
     row = CustomAction.objects.filter(id=action_id, organization_id=oid).first()
     if not row:
         return error("Custom action not found", http_status=404)
@@ -302,6 +312,7 @@ def _store_redirect(url: str) -> str:
 @permission_classes([CookieAuthenticated])
 def execute_custom_action(request, action_id):
     oid = org_id(request)
+    assert_feature(oid, FEATURE_CUSTOM_ACTIONS)
     row = CustomAction.objects.filter(id=action_id, organization_id=oid).first()
     if not row:
         return error("Custom action not found", http_status=404)
