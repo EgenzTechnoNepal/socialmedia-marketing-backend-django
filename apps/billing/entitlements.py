@@ -75,6 +75,25 @@ def whatsapp_accounts_used(organization_id) -> int:
 
     return WhatsAppAccount.objects.filter(organization_id=organization_id).count()
 
+
+def assert_can_add_whatsapp_account(organization_id) -> OrganizationSubscription:
+    sub = get_or_create_subscription(organization_id)
+
+    if not sub.is_usable:
+        raise EntitlementError(
+            "Subscription is not active. Update billing to add WhatsApp accounts."
+        )
+
+    used = whatsapp_accounts_used(organization_id)
+    limit = int(sub.plan.included_wa_accounts)
+
+    if used >= limit:
+        raise EntitlementError(
+            f"WhatsApp account limit reached ({used}/{limit}). Upgrade your plan to add more WhatsApp accounts."
+        )
+
+    return sub
+
 def lock_organization(organization_id) -> Organization:
     return Organization.objects.select_for_update().get(id=organization_id)
 

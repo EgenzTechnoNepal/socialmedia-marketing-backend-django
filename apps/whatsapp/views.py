@@ -6,6 +6,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from apps.accounts.models import Organization
 from apps.billing.entitlements import (
     FEATURE_EXTRA_WA,
+    assert_can_add_whatsapp_account,
     assert_feature,
     get_or_create_subscription,
     lock_organization,
@@ -71,7 +72,7 @@ def accounts_collection(request):
         lock_organization(oid)
 
         existing = WhatsAppAccount.objects.filter(organization_id=oid).count()
-        get_or_create_subscription(oid)
+        assert_can_add_whatsapp_account(oid)
 
         if existing >= 1:
             assert_feature(oid, FEATURE_EXTRA_WA)
@@ -273,12 +274,12 @@ def exchange_token(request):
             phone_id=phone_id,
         ).first()
 
-        get_or_create_subscription(oid)
-
-        if existing is None and WhatsAppAccount.objects.filter(
-            organization_id=oid
-        ).count() >= 1:
-            assert_feature(oid, FEATURE_EXTRA_WA)
+        if existing is None:
+            assert_can_add_whatsapp_account(oid)
+            if WhatsAppAccount.objects.filter(
+                organization_id=oid
+            ).count() >= 1:
+                assert_feature(oid, FEATURE_EXTRA_WA)
 
         if existing:
             account = existing

@@ -65,7 +65,6 @@ def _role_payload(role) -> dict:
 @permission_classes([CookieAuthenticated])
 def roles_collection(request):
     oid = org_id(request)
-    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     if request.method == "GET":
         page, limit, offset = parse_pagination(request)
         qs = CustomRole.objects.filter(organization_id=oid)
@@ -75,7 +74,7 @@ def roles_collection(request):
         total = qs.count()
         roles = list(qs.order_by("name")[offset : offset + limit])
         return success(list_payload("roles", [_role_payload(r) for r in roles], total, page, limit))
-
+    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     data = request.data if isinstance(request.data, dict) else {}
     name = (data.get("name") or "").strip()
     if not name:
@@ -97,13 +96,13 @@ def roles_collection(request):
 @permission_classes([CookieAuthenticated])
 def role_detail(request, role_id):
     oid = org_id(request)
-    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     try:
         role = CustomRole.objects.get(id=role_id, organization_id=oid)
     except CustomRole.DoesNotExist:
         return error("Role not found", http_status=404)
     if request.method == "GET":
         return success(_role_payload(role))
+    assert_feature(oid, FEATURE_CUSTOM_ROLES)
     if request.method == "DELETE":
         if role.is_system:
             return error("System roles cannot be deleted", http_status=400)
