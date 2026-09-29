@@ -160,9 +160,9 @@ def _org_id(data: dict) -> str | None:
     return None
 
 
-def _plan_for_product(product_id: str) -> BillingPlan | None:
+def _plan_for_product(product_id: str) -> tuple[BillingPlan | None, str | None]:
     if not product_id:
-        return None
+        return None, None
     plan = BillingPlan.objects.filter(dodo_price_id_monthly=product_id).first()
     if plan:
         return plan, INTERVAL_MONTHLY
