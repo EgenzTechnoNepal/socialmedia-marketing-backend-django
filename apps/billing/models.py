@@ -104,6 +104,8 @@ class BillingPlan(models.Model):
     dodo_price_id_monthly = models.CharField(max_length=128, blank=True)
     dodo_price_id_yearly = models.CharField(max_length=128, blank=True)
     dodo_seat_addon_id = models.CharField(max_length=128, blank=True)
+    dodo_seat_addon_id_monthly = models.CharField(max_length=128, blank=True)
+    dodo_seat_addon_id_yearly = models.CharField(max_length=128, blank=True)
     extra_seat_price_monthly = models.PositiveIntegerField(default=0)
     extra_seat_price_yearly = models.PositiveIntegerField(default=0)
 
@@ -130,10 +132,10 @@ class BillingPlan(models.Model):
     
     @property
     def is_checkout_ready(self):
-        return self.is_paid and bool(self.dodo_product_id)
-        
+        return self.is_paid and (self.price_monthly > 0 or self.price_yearly > 0)
+
     def is_checkout_ready_for_interval(self, interval: str) -> bool:
-        return self.is_checkout_ready and bool(self.dodo_price_id_for_interval(interval))
+        return self.is_paid and self.price_for_interval(interval) > 0
 
     def price_for_interval(self, interval: str) -> int:
         if interval == INTERVAL_YEARLY:
