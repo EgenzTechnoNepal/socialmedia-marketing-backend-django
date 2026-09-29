@@ -564,6 +564,15 @@ class WebhookTests(BillingTestBase):
         sub = OrganizationSubscription.objects.get(organization=self.org)
         self.assertEqual(sub.plan_id, self.pro.id)
 
+    def test_empty_product_id_does_not_crash_or_change_the_plan(self):
+        self.make_paid_sub(plan=self.pro)
+        response = self.deliver(
+            self.sub_event("subscription.plan_changed", product_id="")
+        )
+        self.assertEqual(response.status_code, 200)
+        sub = OrganizationSubscription.objects.get(organization=self.org)
+        self.assertEqual(sub.plan_id, self.pro.id)
+
 
 class PaymentProfileTenantTests(BillingTestBase):
     data = {
