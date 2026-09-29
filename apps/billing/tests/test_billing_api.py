@@ -220,6 +220,7 @@ class CheckoutApiTests(BillingTestBase):
     @patch("apps.billing.services.dodo.create_checkout_session")
     def test_checkout_blocked_when_interval_not_configured(self, mocked):
         self.pro.dodo_price_id_yearly = ""
+        self.pro.price_yearly = 0
         self.pro.save()
         response = self.client.post(
             f"{BASE}/checkout",
