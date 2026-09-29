@@ -156,12 +156,24 @@ DODO_WEBHOOK_SECRET=
 DODO_ENVIRONMENT=test_mode
 DODO_RETURN_URL=http://localhost:3000/settings/billing
 DODO_PRODUCT_PRO=
+DODO_PRICE_PRO_MONTHLY=
+DODO_PRICE_PRO_YEARLY=
 DODO_PRODUCT_BUSINESS=
+DODO_PRICE_BUSINESS_MONTHLY=
+DODO_PRICE_BUSINESS_YEARLY=
 DODO_ADDON_SEAT=
 DODO_METER_MESSAGE_SENT=message.sent
 DODO_METER_AI_COMPLETION=ai.completion
 DODO_METER_CAMPAIGN_RECIPIENT=campaign.recipient
 ```
+
+Dodo test-mode setup checklist:
+
+- Set `DODO_PRODUCT_PRO` and `DODO_PRODUCT_BUSINESS` to the matching Dodo product IDs.
+- Set `DODO_PRICE_PRO_MONTHLY` and `DODO_PRICE_PRO_YEARLY` to the Pro monthly and yearly price IDs.
+- Set `DODO_PRICE_BUSINESS_MONTHLY` and `DODO_PRICE_BUSINESS_YEARLY` to the Business monthly and yearly price IDs.
+- Leave a price ID blank to keep that plan interval unavailable for checkout; do not put a product ID in a price ID variable.
+- After changing these values, run `python manage.py seed_billing` so the database uses the updated IDs.
 
 Dodo webhook path: `POST /api/webhooks/dodo`. Keep this endpoint; do not add a second billing webhook route.
 
