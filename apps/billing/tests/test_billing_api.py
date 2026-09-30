@@ -29,6 +29,7 @@ from apps.billing.models import (
     BillingPayment,
     BillingPlan,
     DodoWebhookEvent,
+    DodoProductSync,
     OrganizationSubscription,
     PaymentProfile,
 )
@@ -150,6 +151,126 @@ class PlansApiTests(BillingTestBase):
         for secret in ("pdt_pro_m", "pdt_pro_y", "pdt_biz_m", "pdt_biz_y"):
             self.assertNotIn(secret, body)
 
+
+class DodoSyncApiTests(BillingTestBase):
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_paid_plan_sync_returns_sync_details(self, mocked):
+        mocked.return_value = "pdt_pro_m"
+
+        DodoProductSync.objects.create(
+            plan=self.pro,
+            interval="monthly",
+            currency="USD",
+            amount=2900,
+            sync_key="whatomate:plan:pro:monthly:usd:2900",
+            dodo_product_id="pdt_pro_m",
+            sync_status=DodoProductSync.STATUS_SYNCED,
+        )
+
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "plan_key": "pro",
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        data = response.data["data"]
+
+        self.assertEqual(data["plan_key"], "pro")
+        self.assertEqual(data["billing_interval"], "monthly")
+        self.assertEqual(data["sync_status"], "synced")
+        self.assertEqual(
+            data["sync_key"],
+            "whatomate:plan:pro:monthly:usd:2900",
+        )
+        self.assertEqual(data["product_id"], "pdt_pro_m")
+        self.assertTrue(data["checkout_ready"])
+
+        mocked.assert_called_once_with(
+            self.pro.id,
+            "monthly",
+        )
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_free_plan_never_calls_sync(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "plan_key": "free",
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+        self.assertFalse(
+            DodoProductSync.objects.filter(plan=self.free).exists()
+        )
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_unknown_plan_is_rejected(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "plan_key": "does-not-exist",
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_missing_plan_key_is_rejected(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_invalid_interval_is_rejected(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "plan_key": "pro",
+                "billing_interval": "weekly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_sync_failure_returns_502(self, mocked):
+        mocked.side_effect = RuntimeError("Dodo unavailable")
+
+        response = self.client.post(
+            f"{BASE}/plans/sync-dodo",
+            {
+                "plan_key": "pro",
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn(
+            "Dodo unavailable",
+            json.dumps(response.data),
+        )
 
 class SubscriptionAndUsageApiTests(BillingTestBase):
     def test_new_org_starts_on_free(self):

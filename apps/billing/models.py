@@ -14,9 +14,9 @@ STATUS_ON_HOLD = "on_hold"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
 
-INTERVAL_MONTHLY="monthly"
-INTERVAL_YEARLY="yearly"
-BILLING_INTERVALS=(INTERVAL_MONTHLY,INTERVAL_YEARLY)
+INTERVAL_MONTHLY= "monthly"
+INTERVAL_YEARLY= "yearly"
+BILLING_INTERVALS= (INTERVAL_MONTHLY,INTERVAL_YEARLY)
 
 METER_MESSAGE_SENT = "message.sent"
 METER_AI_COMPLETION = "ai.completion"
@@ -173,6 +173,65 @@ class BillingPlan(models.Model):
         elif interval == INTERVAL_MONTHLY:
             return self.extra_seat_price_monthly
         raise ValueError(f"Unknown billing interval: {interval}")
+class DodoProductSync(models.Model):
+    STATUS_PENDING = "pending"
+    STATUS_SYNCED = "synced"
+    STATUS_ERROR = "error"
+
+    SYNC_STATUSES = (
+        (STATUS_PENDING, "Pending"),
+        (STATUS_SYNCED, "Synced"),
+        (STATUS_ERROR, "Error"),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    plan = models.ForeignKey(
+        BillingPlan,
+        on_delete=models.CASCADE,
+        related_name="dodo_product_syncs",
+    )
+
+    interval = models.CharField(
+        max_length=16,
+        choices=[(i, i) for i in BILLING_INTERVALS],
+    )
+
+    currency = models.CharField(max_length=3)
+
+    # Amount in minor units, e.g. USD 29.00 = 2900
+    amount = models.PositiveIntegerField()
+
+    # Example:
+    # whatomate:plan:pro:monthly:usd:2900
+    sync_key = models.CharField(max_length=255, unique=True)
+
+    dodo_product_id = models.CharField(max_length=128, blank=True)
+    dodo_price_id = models.CharField(max_length=128, blank=True)
+
+    sync_status = models.CharField(
+        max_length=16,
+        choices=SYNC_STATUSES,
+        default=STATUS_PENDING,
+    )
+
+    sync_error = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "billing_dodo_product_syncs"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["plan", "interval", "currency", "amount"],
+                name="uniq_dodo_product_sync_plan_interval_amount",
+            ),
+        ]
+        ordering = ["plan__display_order", "plan__key", "interval"]
+
+    def __str__(self):
+        return self.sync_key
 class OrganizationSubscription(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.OneToOneField(

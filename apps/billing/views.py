@@ -38,10 +38,12 @@ from .models import (
     BillingPlan,
     OrganizationSubscription,
     PaymentProfile,
+    DodoProductSync,
 )
 from .services import dodo
 from .services.dodo import DodoNotConfigured
 from .services.invoice import build_invoice_data, generate_invoice_pdf
+from apps.billing.services.dodo_sync import ensure_synced_plan_product
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +117,6 @@ def _plan_payload(plan: BillingPlan):
         },
     }
 
-
 def _sub_payload(sub: OrganizationSubscription, org_id):
     used = seats_used(org_id)
     return {
@@ -144,6 +145,65 @@ def _sub_payload(sub: OrganizationSubscription, org_id):
 def list_plans(request):
     plans = BillingPlan.objects.filter(is_active=True)
     return success({"plans": [_plan_payload(p) for p in plans]})
+
+
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated, HasBillingAccess])
+def sync_dodo_product(request):
+    plan_key = (request.data.get("plan_key") or "").strip()
+    interval = _parse_interval(request.data.get("billing_interval"))
+
+    if not plan_key:
+        return error("plan_key is required", http_status=400)
+
+    plan = BillingPlan.objects.filter(
+        key=plan_key,
+        is_active=True,
+    ).first()
+
+    if not plan:
+        return error("Unknown plan", http_status=400)
+
+    if not plan.is_paid:
+        return error(
+            "Free plans do not have Dodo products",
+            http_status=400,
+        )
+
+    try:
+        product_id = ensure_synced_plan_product(
+            plan.id,
+            interval,
+        )
+    except ValueError as exc:
+        return error(str(exc), http_status=400)
+    except Exception:
+        logger.exception("Dodo product synchronization failed")
+        return error(
+            "Dodo product synchronization failed",
+            http_status=502,
+        )
+
+    sync_record = DodoProductSync.objects.filter(
+        plan=plan,
+        interval=interval,
+    ).first()
+
+    # Refresh because ensure_synced_plan_product() may update
+    # BillingPlan through a separate database update.
+    plan.refresh_from_db()
+
+    return success(
+        {
+            "plan_key": plan.key,
+            "billing_interval": interval,
+            "sync_status": sync_record.sync_status if sync_record else None,
+            "sync_key": sync_record.sync_key if sync_record else None,
+            "product_id": product_id,
+            "sync_error": sync_record.sync_error if sync_record else None,
+            "checkout_ready": plan.is_checkout_ready_for_interval(interval),
+        }
+    )
 
 
 @api_view(["GET"])
@@ -260,6 +320,8 @@ def change_plan(request):
         "extra_seats": extra_seats,
     }
     return success(payload)
+
+
 @api_view(["POST"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
 def cancel_subscription(request):
