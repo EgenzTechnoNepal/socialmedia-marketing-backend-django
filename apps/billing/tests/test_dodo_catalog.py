@@ -26,7 +26,7 @@ class DodoCatalogTests(TestCase):
         self.client.addons.create.return_value = SimpleNamespace(addon_id="addon_pro_monthly")
 
     @patch("apps.billing.services.dodo._client")
-    def test_plan_product_is_created_once_and_uses_stable_catalog_key(self, make_client):
+    def test_plan_product_is_created_once_and_uses_sku_metadata(self, make_client):
         make_client.return_value = self.client
 
         first_id = dodo.ensure_plan_product(self.plan, "monthly")
@@ -36,9 +36,31 @@ class DodoCatalogTests(TestCase):
         self.assertEqual(second_id, first_id)
         self.client.products.create.assert_called_once()
         kwargs = self.client.products.create.call_args.kwargs
-        self.assertEqual(kwargs["metadata"]["catalog_key"], "whatomate:plan:pro:monthly:usd:2900")
+        self.assertEqual(kwargs["metadata"]["whatomate_sku"], "whatomate:plan:pro:monthly:usd:2900")
         self.assertEqual(kwargs["extra_headers"]["Idempotency-Key"], "whatomate:plan:pro:monthly:usd:2900")
         self.assertEqual(kwargs["price"]["payment_frequency_interval"], "Month")
+
+    @patch("apps.billing.services.dodo._client")
+    def test_price_change_creates_new_product_and_archives_old_id(self, make_client):
+        make_client.return_value = self.client
+        self.client.products.create.side_effect = [
+            SimpleNamespace(product_id="pdt_pro_monthly_v1"),
+            SimpleNamespace(product_id="pdt_pro_monthly_v2"),
+        ]
+
+        self.assertEqual(dodo.ensure_plan_product(self.plan, "monthly"), "pdt_pro_monthly_v1")
+        self.plan.refresh_from_db()
+        self.plan.price_monthly = 3100
+        self.plan.save(update_fields=["price_monthly"])
+
+        self.assertEqual(dodo.ensure_plan_product(self.plan, "monthly"), "pdt_pro_monthly_v2")
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.dodo_price_id_monthly, "pdt_pro_monthly_v2")
+        self.assertEqual(self.plan.dodo_former_product_ids, ["pdt_pro_monthly_v1"])
+        self.assertEqual(
+            self.client.products.create.call_args.kwargs["metadata"]["whatomate_sku"],
+            "whatomate:plan:pro:monthly:usd:3100",
+        )
 
     @patch("apps.billing.services.dodo._client")
     def test_seat_addon_is_created_once(self, make_client):

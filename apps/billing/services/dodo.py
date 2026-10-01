@@ -9,6 +9,7 @@ from typing import Any
 
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -50,81 +51,143 @@ def ensure_plan_product(plan, interval: str) -> str:
     """Return the Dodo subscription product for a plan interval, creating it once."""
     if interval not in ("monthly", "yearly"):
         raise ValueError(f"Unknown billing interval: {interval}")
-    if not plan.is_paid:
-        raise ValueError("Free plans do not have Dodo products")
-    field = "dodo_price_id_yearly" if interval == "yearly" else "dodo_price_id_monthly"
-    product_id = getattr(plan, field)
-    if product_id:
-        return product_id
-
-    price = plan.price_for_interval(interval)
-    if price <= 0:
-        raise ValueError(f"{plan.key} {interval} price must be greater than zero")
-    currency = (plan.currency or "USD").upper()
-    key = _catalog_key("whatomate", "plan", plan.key, interval, currency, price)
-    product = _client().products.create(
-        name=f"{plan.name} ({interval.title()})",
-        description=plan.description or f"{plan.name} {interval} subscription",
-        tax_category="saas",
-        price={
-            "type": "recurring_price",
-            "price": price,
-            "currency": currency,
-            "payment_frequency_interval": "Month" if interval == "monthly" else "Year",
-            "payment_frequency_count": 1,
-        },
-        metadata={"catalog_key": key},
-        extra_headers={"Idempotency-Key": key},
-    )
-    product_id = _object_id(product, "product_id", "id")
-    if not product_id:
-        raise DodoNotConfigured("Dodo did not return a product ID")
-
-    # Persist the returned ID immediately. A subsequent request or sync reuses it.
+    model = type(plan)
+    id_field = f"dodo_price_id_{interval}"
+    sku_field = f"dodo_sku_{interval}"
     with transaction.atomic():
-        type(plan).objects.filter(pk=plan.pk, **{field: ""}).update(**{field: product_id})
-        if interval == "monthly" and not plan.dodo_product_id:
-            type(plan).objects.filter(pk=plan.pk, dodo_product_id="").update(dodo_product_id=product_id)
-    setattr(plan, field, product_id)
-    if interval == "monthly" and not plan.dodo_product_id:
-        plan.dodo_product_id = product_id
-    return product_id
+        locked_plan = model.objects.select_for_update().get(pk=plan.pk)
+        if not locked_plan.is_paid:
+            raise ValueError("Free plans do not have Dodo products")
+        price = locked_plan.price_for_interval(interval)
+        if price <= 0:
+            raise ValueError(f"{locked_plan.key} {interval} price must be greater than zero")
+        currency = (locked_plan.currency or "USD").upper()
+        sku = _catalog_key("whatomate", "plan", locked_plan.key, interval, currency, price)
+        product_id = getattr(locked_plan, id_field)
+        current_sku = getattr(locked_plan, sku_field)
+
+        if product_id and not current_sku:
+            # Adopt IDs created before SKU signatures were persisted.
+            current_sku = sku
+            setattr(locked_plan, sku_field, sku)
+        if product_id and current_sku == sku:
+            locked_plan.dodo_synced_at = timezone.now()
+            locked_plan.dodo_sync_error = ""
+            locked_plan.save(update_fields=[sku_field, "dodo_synced_at", "dodo_sync_error"])
+            setattr(plan, sku_field, sku)
+            plan.dodo_synced_at = locked_plan.dodo_synced_at
+            plan.dodo_sync_error = ""
+            return product_id
+
+        try:
+            product = _client().products.create(
+                name=f"{locked_plan.name} ({interval.title()})",
+                description=locked_plan.description or f"{locked_plan.name} {interval} subscription",
+                tax_category="saas",
+                price={
+                    "type": "recurring_price",
+                    "price": price,
+                    "currency": currency,
+                    "payment_frequency_interval": "Month" if interval == "monthly" else "Year",
+                    "payment_frequency_count": 1,
+                },
+                metadata={"whatomate_sku": sku},
+                extra_headers={"Idempotency-Key": sku},
+            )
+            new_product_id = _object_id(product, "product_id", "id")
+            if not new_product_id:
+                raise DodoNotConfigured("Dodo did not return a product ID")
+        except Exception as exc:
+            locked_plan.dodo_sync_error = str(exc)
+            locked_plan.save(update_fields=["dodo_sync_error"])
+            plan.dodo_sync_error = str(exc)
+            raise
+
+        former_ids = list(locked_plan.dodo_former_product_ids or [])
+        if product_id and product_id not in former_ids:
+            former_ids.append(product_id)
+        locked_plan.dodo_former_product_ids = former_ids
+        setattr(locked_plan, id_field, new_product_id)
+        setattr(locked_plan, sku_field, sku)
+        locked_plan.dodo_synced_at = timezone.now()
+        locked_plan.dodo_sync_error = ""
+        update_fields = [id_field, sku_field, "dodo_former_product_ids", "dodo_synced_at", "dodo_sync_error"]
+        if interval == "monthly" and not locked_plan.dodo_product_id:
+            locked_plan.dodo_product_id = new_product_id
+            update_fields.append("dodo_product_id")
+        locked_plan.save(update_fields=update_fields)
+
+    for field in (id_field, sku_field, "dodo_former_product_ids", "dodo_synced_at", "dodo_sync_error"):
+        setattr(plan, field, getattr(locked_plan, field))
+    if interval == "monthly":
+        plan.dodo_product_id = locked_plan.dodo_product_id
+    return new_product_id
 
 
 def ensure_seat_addon(plan, interval: str = "monthly") -> str:
     """Return/create the interval-specific seat add-on for a plan."""
     if interval not in ("monthly", "yearly"):
         raise ValueError(f"Unknown billing interval: {interval}")
-    field = f"dodo_seat_addon_id_{interval}"
-    addon_id = (
-        getattr(plan, field, "")
-        or plan.dodo_seat_addon_id
-        or getattr(settings, "DODO_ADDON_SEAT", "")
-    )
-    if addon_id:
-        if not getattr(plan, field, ""):
-            type(plan).objects.filter(pk=plan.pk, **{field: ""}).update(**{field: addon_id})
-            setattr(plan, field, addon_id)
-        return addon_id
-    price = plan.extra_seat_price_for_interval(interval)
-    if price <= 0:
-        raise ValueError(f"{plan.key} {interval} seat price must be greater than zero")
-    currency = (plan.currency or "USD").upper()
-    key = _catalog_key("whatomate", "seat", plan.key, interval, currency, price)
-    addon = _client().addons.create(
-        name=f"{plan.name} extra seat ({interval})",
-        description=f"One extra seat for {plan.name} {interval}; catalog key {key}",
-        currency=currency,
-        price=price,
-        tax_category="saas",
-        extra_headers={"Idempotency-Key": key},
-    )
-    addon_id = _object_id(addon, "addon_id", "id")
-    if not addon_id:
-        raise DodoNotConfigured("Dodo did not return a seat add-on ID")
-    type(plan).objects.filter(pk=plan.pk, **{field: ""}).update(**{field: addon_id})
-    setattr(plan, field, addon_id)
-    return addon_id
+    model = type(plan)
+    id_field = f"dodo_seat_addon_id_{interval}"
+    sku_field = f"dodo_sku_seat_{interval}"
+    with transaction.atomic():
+        locked_plan = model.objects.select_for_update().get(pk=plan.pk)
+        price = locked_plan.extra_seat_price_for_interval(interval)
+        currency = (locked_plan.currency or "USD").upper()
+        sku = _catalog_key("whatomate", "seat", locked_plan.key, interval, currency, price)
+        addon_id = getattr(locked_plan, id_field)
+        current_sku = getattr(locked_plan, sku_field)
+
+        if addon_id and not current_sku:
+            current_sku = sku
+            setattr(locked_plan, sku_field, sku)
+        if addon_id and current_sku == sku:
+            locked_plan.dodo_synced_at = timezone.now()
+            locked_plan.dodo_sync_error = ""
+            locked_plan.save(update_fields=[sku_field, "dodo_synced_at", "dodo_sync_error"])
+            setattr(plan, sku_field, sku)
+            return addon_id
+
+        if not addon_id:
+            addon_id = locked_plan.dodo_seat_addon_id or getattr(settings, "DODO_ADDON_SEAT", "")
+            if addon_id:
+                setattr(locked_plan, id_field, addon_id)
+                setattr(locked_plan, sku_field, sku)
+                locked_plan.save(update_fields=[id_field, sku_field])
+                setattr(plan, id_field, addon_id)
+                setattr(plan, sku_field, sku)
+                return addon_id
+        if price <= 0:
+            raise ValueError(f"{locked_plan.key} {interval} seat price must be greater than zero")
+
+        try:
+            addon = _client().addons.create(
+                name=f"{locked_plan.name} extra seat ({interval})",
+                description=f"One extra seat for {locked_plan.name} {interval}; catalog key {sku}",
+                currency=currency,
+                price=price,
+                tax_category="saas",
+                extra_headers={"Idempotency-Key": sku},
+            )
+            new_addon_id = _object_id(addon, "addon_id", "id")
+            if not new_addon_id:
+                raise DodoNotConfigured("Dodo did not return a seat add-on ID")
+        except Exception as exc:
+            locked_plan.dodo_sync_error = str(exc)
+            locked_plan.save(update_fields=["dodo_sync_error"])
+            plan.dodo_sync_error = str(exc)
+            raise
+
+        setattr(locked_plan, id_field, new_addon_id)
+        setattr(locked_plan, sku_field, sku)
+        locked_plan.dodo_synced_at = timezone.now()
+        locked_plan.dodo_sync_error = ""
+        locked_plan.save(update_fields=[id_field, sku_field, "dodo_synced_at", "dodo_sync_error"])
+
+    for field in (id_field, sku_field, "dodo_synced_at", "dodo_sync_error"):
+        setattr(plan, field, getattr(locked_plan, field))
+    return new_addon_id
 
 
 def create_checkout_session(
