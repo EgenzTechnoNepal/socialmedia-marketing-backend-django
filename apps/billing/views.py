@@ -38,7 +38,6 @@ from .models import (
     BillingPlan,
     OrganizationSubscription,
     PaymentProfile,
-    DodoProductSync,
 )
 from .services import dodo
 from .services.dodo import DodoNotConfigured
@@ -149,15 +148,11 @@ def list_plans(request):
 
 @api_view(["POST"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
-def sync_dodo_product(request):
-    plan_key = (request.data.get("plan_key") or "").strip()
+def sync_dodo_product(request, key):
     interval = _parse_interval(request.data.get("billing_interval"))
 
-    if not plan_key:
-        return error("plan_key is required", http_status=400)
-
     plan = BillingPlan.objects.filter(
-        key=plan_key,
+        key=key,
         is_active=True,
     ).first()
 
@@ -171,10 +166,7 @@ def sync_dodo_product(request):
         )
 
     try:
-        product_id = ensure_synced_plan_product(
-            plan.id,
-            interval,
-        )
+        ensure_synced_plan_product(plan.id, interval)
     except ValueError as exc:
         return error(str(exc), http_status=400)
     except Exception:
@@ -184,24 +176,18 @@ def sync_dodo_product(request):
             http_status=502,
         )
 
-    sync_record = DodoProductSync.objects.filter(
-        plan=plan,
-        interval=interval,
-    ).first()
-
-    # Refresh because ensure_synced_plan_product() may update
-    # BillingPlan through a separate database update.
     plan.refresh_from_db()
 
     return success(
         {
-            "plan_key": plan.key,
-            "billing_interval": interval,
-            "sync_status": sync_record.sync_status if sync_record else None,
-            "sync_key": sync_record.sync_key if sync_record else None,
-            "product_id": product_id,
-            "sync_error": sync_record.sync_error if sync_record else None,
+            "key": plan.key,
             "checkout_ready": plan.is_checkout_ready_for_interval(interval),
+            "synced_at": (
+                plan.dodo_synced_at.isoformat()
+                if plan.dodo_synced_at
+                else None
+            ),
+            "sync_error": plan.dodo_sync_error,
         }
     )
 

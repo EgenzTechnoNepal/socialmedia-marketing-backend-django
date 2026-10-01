@@ -4,7 +4,11 @@ from . import views
 
 urlpatterns = [
     path("plans", views.list_plans),
-    path("plans/sync-dodo", views.sync_dodo_product, name="billing-sync-dodo"),
+    path(
+        "plans/<str:key>/sync-dodo",
+        views.sync_dodo_product,
+        name="billing-sync-dodo",
+    ),
     path("subscription", views.get_subscription),
     path("checkout", views.create_checkout),
     path("change-plan", views.change_plan),

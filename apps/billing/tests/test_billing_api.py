@@ -14,6 +14,7 @@ from uuid import uuid4
 from apps.common.schema import apply_product_schema
 from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import Resolver404, resolve
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Organization
@@ -29,7 +30,6 @@ from apps.billing.models import (
     BillingPayment,
     BillingPlan,
     DodoWebhookEvent,
-    DodoProductSync,
     OrganizationSubscription,
     PaymentProfile,
 )
@@ -154,23 +154,16 @@ class PlansApiTests(BillingTestBase):
 
 class DodoSyncApiTests(BillingTestBase):
     @patch("apps.billing.views.ensure_synced_plan_product")
-    def test_paid_plan_sync_returns_sync_details(self, mocked):
+    def test_paid_plan_sync_returns_frozen_contract(self, mocked):
         mocked.return_value = "pdt_pro_m"
 
-        DodoProductSync.objects.create(
-            plan=self.pro,
-            interval="monthly",
-            currency="USD",
-            amount=2900,
-            sync_key="whatomate:plan:pro:monthly:usd:2900",
-            dodo_product_id="pdt_pro_m",
-            sync_status=DodoProductSync.STATUS_SYNCED,
-        )
+        self.pro.dodo_synced_at = timezone.now()
+        self.pro.dodo_sync_error = ""
+        self.pro.save(update_fields=["dodo_synced_at", "dodo_sync_error"])
 
         response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
+            f"{BASE}/plans/pro/sync-dodo",
             {
-                "plan_key": "pro",
                 "billing_interval": "monthly",
             },
             format="json",
@@ -180,15 +173,18 @@ class DodoSyncApiTests(BillingTestBase):
 
         data = response.data["data"]
 
-        self.assertEqual(data["plan_key"], "pro")
-        self.assertEqual(data["billing_interval"], "monthly")
-        self.assertEqual(data["sync_status"], "synced")
         self.assertEqual(
-            data["sync_key"],
-            "whatomate:plan:pro:monthly:usd:2900",
+            set(data.keys()),
+            {"key", "checkout_ready", "synced_at", "sync_error"},
         )
-        self.assertEqual(data["product_id"], "pdt_pro_m")
+        self.assertEqual(data["key"], "pro")
         self.assertTrue(data["checkout_ready"])
+        self.assertIsNotNone(data["synced_at"])
+        self.assertEqual(data["sync_error"], "")
+
+        self.assertNotIn("product_id", data)
+        self.assertNotIn("sync_status", data)
+        self.assertNotIn("sync_key", data)
 
         mocked.assert_called_once_with(
             self.pro.id,
@@ -198,9 +194,8 @@ class DodoSyncApiTests(BillingTestBase):
     @patch("apps.billing.views.ensure_synced_plan_product")
     def test_free_plan_never_calls_sync(self, mocked):
         response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
+            f"{BASE}/plans/free/sync-dodo",
             {
-                "plan_key": "free",
                 "billing_interval": "monthly",
             },
             format="json",
@@ -208,28 +203,11 @@ class DodoSyncApiTests(BillingTestBase):
 
         self.assertEqual(response.status_code, 400)
         mocked.assert_not_called()
-        self.assertFalse(
-            DodoProductSync.objects.filter(plan=self.free).exists()
-        )
 
     @patch("apps.billing.views.ensure_synced_plan_product")
     def test_unknown_plan_is_rejected(self, mocked):
         response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
-            {
-                "plan_key": "does-not-exist",
-                "billing_interval": "monthly",
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 400)
-        mocked.assert_not_called()
-
-    @patch("apps.billing.views.ensure_synced_plan_product")
-    def test_missing_plan_key_is_rejected(self, mocked):
-        response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
+            f"{BASE}/plans/does-not-exist/sync-dodo",
             {
                 "billing_interval": "monthly",
             },
@@ -242,9 +220,8 @@ class DodoSyncApiTests(BillingTestBase):
     @patch("apps.billing.views.ensure_synced_plan_product")
     def test_invalid_interval_is_rejected(self, mocked):
         response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
+            f"{BASE}/plans/pro/sync-dodo",
             {
-                "plan_key": "pro",
                 "billing_interval": "weekly",
             },
             format="json",
@@ -258,9 +235,8 @@ class DodoSyncApiTests(BillingTestBase):
         mocked.side_effect = RuntimeError("Dodo unavailable")
 
         response = self.client.post(
-            f"{BASE}/plans/sync-dodo",
+            f"{BASE}/plans/pro/sync-dodo",
             {
-                "plan_key": "pro",
                 "billing_interval": "monthly",
             },
             format="json",
