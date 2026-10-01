@@ -12,7 +12,7 @@ from apps.common.exceptions import APIError
 from apps.common.http import is_super, list_payload, org_id, parse_pagination, require_perm
 from apps.common.permissions import CookieAuthenticated
 from apps.realtime.hub import online_user_ids
-
+from apps.common.tokens import SessionInvalidationError, invalidate_user_sessions
 
 def _org_users_qs(oid):
     member_ids = UserOrganization.objects.filter(organization_id=oid).values("user_id")
@@ -154,19 +154,37 @@ def user_detail(request, user_id):
         user.full_name = data.get("full_name") or user.full_name
     if "email" in data and data.get("email"):
         user.email = data["email"].strip()
+    password_changed = False
+
     if data.get("password"):
-        user.password_hash = bcrypt.hashpw(str(data["password"]).encode("utf-8"), bcrypt.gensalt(rounds=10)).decode(
-            "utf-8"
-        )
+        user.password_hash = bcrypt.hashpw(
+            str(data["password"]).encode("utf-8"),
+            bcrypt.gensalt(rounds=10),
+        ).decode("utf-8")
+        password_changed = True
+
     if "is_active" in data and not self_update:
         user.is_active = bool(data["is_active"])
+
     if "role_id" in data:
         require_perm(request, "users", "write")
         user.role_id = data.get("role_id")
         if membership:
             membership.role_id = data.get("role_id")
             membership.save(update_fields=["role_id", "updated_at"])
+
     if "is_super_admin" in data and is_super(request):
         user.is_super_admin = bool(data["is_super_admin"])
+
     user.save()
+
+    if password_changed:
+        try:
+            invalidate_user_sessions(user.id)
+        except SessionInvalidationError:
+            return error(
+                "Password was updated, but active sessions could not be invalidated. Please contact support.",
+                http_status=503,
+                error_type="session_invalidation",
+            )
     return success(_user_payload(user, oid))

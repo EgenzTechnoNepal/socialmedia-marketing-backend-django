@@ -16,14 +16,21 @@ from apps.common.cookies import (
 )
 from apps.common.envelope import error, success
 from apps.common.permissions import CookieAuthenticated
+from apps.common.throttles import LoginRateThrottle
 from apps.billing.entitlements import assert_can_add_seat, lock_organization
 from apps.common.tokens import (
     DUMMY_BCRYPT,
+    RefreshTokenConsumptionError,
+    RefreshTokenStorageError,
+    SessionInvalidationError,
+    SessionVersionStorageError,
     consume_refresh_jti,
     decode_token,
     generate_access_token,
     generate_refresh_token,
     generate_ws_token,
+    get_session_version,
+    invalidate_user_sessions,
     revoke_refresh_jti,
 )
 
@@ -33,8 +40,17 @@ logger = logging.getLogger(__name__)
 def _issue_auth(user: User, organization_id=None):
     org_id = organization_id if organization_id is not None else user.organization_id
     apply_org_role(user, org_id)
-    access = generate_access_token(user, org_id)
-    refresh = generate_refresh_token(user, org_id)
+
+    try:
+        access = generate_access_token(user, org_id)
+        refresh = generate_refresh_token(user, org_id)
+    except (SessionVersionStorageError, RefreshTokenStorageError):
+        return error(
+            "Unable to create a secure authentication session. Please try again.",
+            http_status=503,
+            error_type="session_storage",
+        )
+
     response = success(
         {
             "expires_in": access_expires_in_seconds(),
@@ -63,6 +79,14 @@ def _refresh_from_request(request) -> str:
 @authentication_classes([])
 @permission_classes([AllowAny])
 def login(request):
+    throttle = LoginRateThrottle()
+
+    if not throttle.allow_request(request, login):
+        return error(
+            "Too many login attempts. Please try again later.",
+            http_status=429,
+            error_type="rate_limited",
+        )
     data = request.data if isinstance(request.data, dict) else {}
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
@@ -186,8 +210,19 @@ def refresh(request):
         return error("Invalid refresh token", http_status=401)
 
     jti = claims.get("jti") or ""
-    if jti and not consume_refresh_jti(jti):
-        return error("Refresh token has been revoked", http_status=401)
+
+    if jti:
+        try:
+            consumed = consume_refresh_jti(jti)
+        except RefreshTokenConsumptionError:
+            return error(
+                "Unable to validate the authentication session. Please try again.",
+                http_status=503,
+                error_type="session_storage",
+            )
+
+        if not consumed:
+            return error("Refresh token has been revoked", http_status=401)
 
     user_id = claims.get("user_id")
     try:
@@ -197,6 +232,18 @@ def refresh(request):
 
     if not user.is_active:
         return error("Account is disabled", http_status=401)
+
+    try:
+        current_session_version = get_session_version(user.id)
+    except SessionVersionStorageError:
+        return error(
+            "Unable to validate the authentication session. Please try again.",
+            http_status=503,
+            error_type="session_storage",
+        )
+
+    if claims.get("session_version") != current_session_version:
+        return error("Refresh token has been revoked", http_status=401)
 
     org_id = claims.get("organization_id") or user.organization_id
     if claims.get("role_id"):
@@ -271,18 +318,41 @@ def me_password(request):
     data = request.data if isinstance(request.data, dict) else {}
     current_password = data.get("current_password") or ""
     new_password = data.get("new_password") or ""
+
     if not current_password or not new_password:
-        return error("current_password and new_password are required", http_status=400)
+        return error(
+            "current_password and new_password are required",
+            http_status=400,
+        )
+
     try:
-        ok = bcrypt.checkpw(current_password.encode("utf-8"), request.user.password_hash.encode("utf-8"))
+        ok = bcrypt.checkpw(
+            current_password.encode("utf-8"),
+            request.user.password_hash.encode("utf-8"),
+        )
     except ValueError:
         ok = False
+
     if not ok:
         return error("Current password is incorrect", http_status=400)
-    request.user.password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
-    request.user.save(update_fields=["password_hash", "updated_at"])
-    return success({"message": "Password updated"})
 
+    request.user.password_hash = bcrypt.hashpw(
+        new_password.encode("utf-8"),
+        bcrypt.gensalt(rounds=10),
+    ).decode("utf-8")
+
+    request.user.save(update_fields=["password_hash", "updated_at"])
+
+    try:
+        invalidate_user_sessions(request.user.id)
+    except SessionInvalidationError:
+        return error(
+            "Password was updated, but active sessions could not be invalidated. Please contact support.",
+            http_status=503,
+            error_type="session_invalidation",
+        )
+
+    return success({"message": "Password updated"})
 
 @api_view(["PUT"])
 @permission_classes([CookieAuthenticated])

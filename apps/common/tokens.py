@@ -15,6 +15,19 @@ _redis = None
 # Valid bcrypt of a dummy string — used only to keep login timing even when the email is unknown.
 DUMMY_BCRYPT = b"$2b$10$5dc6chKPANAoKXxMi3XZ0./doPimFFmBiAHu9Rd4e/5Q/1HwchfBm"
 
+class RefreshTokenStorageError(Exception):
+    """Raised when a refresh token cannot be persisted in Redis."""
+
+
+class RefreshTokenConsumptionError(Exception):
+    """Raised when a refresh token cannot be consumed in Redis."""
+
+class SessionInvalidationError(Exception):
+    """Raised when user session invalidation cannot be persisted in Redis."""
+
+class SessionVersionStorageError(Exception):
+    """Raised when the session version cannot be read from Redis."""
+
 
 def redis_client():
     global _redis
@@ -25,6 +38,46 @@ def redis_client():
 
 def refresh_token_key(jti: str) -> str:
     return f"refresh:{jti}"
+
+
+def session_version_key(user_id) -> str:
+    return f"auth:session-version:{user_id}"
+
+
+def get_session_version(user_id) -> int:
+    try:
+        value = redis_client().get(session_version_key(user_id))
+
+        if value is None:
+            stored = redis_client().set(session_version_key(user_id), "1")
+            if not stored:
+                raise SessionVersionStorageError(
+                    "Unable to initialize session version"
+                )
+            return 1
+
+        return int(value)
+
+    except redis.RedisError as exc:
+        logger.exception("Failed to get session version from Redis")
+        raise SessionVersionStorageError(
+            "Unable to read session version"
+        ) from exc
+
+    except ValueError as exc:
+        logger.exception("Invalid session version stored in Redis")
+        raise SessionVersionStorageError(
+            "Invalid session version"
+        ) from exc
+
+def invalidate_user_sessions(user_id) -> None:
+    try:
+        redis_client().incr(session_version_key(user_id))
+    except redis.RedisError as exc:
+        logger.exception("Failed to invalidate user sessions in Redis")
+        raise SessionInvalidationError(
+            "Unable to invalidate user sessions"
+        ) from exc
 
 
 def _now():
@@ -56,14 +109,31 @@ def generate_refresh_token(user: User, organization_id=None) -> str:
     org_id = organization_id if organization_id is not None else user.organization_id
     jti = str(uuid.uuid4())
     expiry = timedelta(days=settings.JWT_REFRESH_EXPIRY_DAYS)
+
     claims = _base_claims(user, org_id)
     claims["jti"] = jti
+    claims["session_version"] = get_session_version(user.id)
     claims["exp"] = _now() + expiry
+
     signed = jwt.encode(claims, settings.JWT_SECRET, algorithm="HS256")
     try:
-        redis_client().set(refresh_token_key(jti), str(user.id), ex=int(expiry.total_seconds()))
-    except redis.RedisError:
+        stored = redis_client().set(
+            refresh_token_key(jti),
+            str(user.id),
+            ex=int(expiry.total_seconds()),
+        )
+    except redis.RedisError as exc:
         logger.exception("Failed to store refresh token in Redis")
+        raise RefreshTokenStorageError(
+            "Unable to create a persistent refresh session"
+        ) from exc
+
+    if not stored:
+        logger.error("Redis did not confirm refresh token storage")
+        raise RefreshTokenStorageError(
+            "Unable to create a persistent refresh session"
+        )
+
     return signed
 
 
@@ -94,9 +164,10 @@ def consume_refresh_jti(jti: str) -> bool:
         return True
     try:
         deleted = redis_client().delete(refresh_token_key(jti))
-    except redis.RedisError:
-        logger.exception("Failed to consume refresh token in Redis")
-        return False
+    except redis.RedisError as exc:
+        raise RefreshTokenConsumptionError(
+            "Unable to validate the refresh session"
+        ) from exc
     return deleted == 1
 
 
