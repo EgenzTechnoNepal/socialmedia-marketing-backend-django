@@ -126,6 +126,9 @@ REST_FRAMEWORK = {
     ],
     "EXCEPTION_HANDLER": "apps.common.envelope.exception_handler",
     "UNAUTHENTICATED_USER": None,
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "5/min",
+    },
 }
 
 CORS_ALLOWED_ORIGINS = env_list(
