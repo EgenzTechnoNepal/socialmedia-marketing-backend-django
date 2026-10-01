@@ -42,6 +42,7 @@ from .models import (
 from .services import dodo
 from .services.dodo import DodoNotConfigured
 from .services.invoice import build_invoice_data, generate_invoice_pdf
+from apps.billing.services.dodo_sync import ensure_synced_plan_product
 
 logger = logging.getLogger(__name__)
 
@@ -106,13 +107,14 @@ def _plan_payload(plan: BillingPlan):
         "features": plan.features,
         "included_quotas": plan.included_quotas,
         "is_paid": plan.is_paid,
-        "has_product": bool(plan.dodo_product_id),
+        "has_product": bool(
+            plan.dodo_product_id or plan.dodo_price_id_monthly or plan.dodo_price_id_yearly
+        ),
         "checkout_ready": {
             "monthly": plan.is_checkout_ready_for_interval(INTERVAL_MONTHLY),
             "yearly": plan.is_checkout_ready_for_interval(INTERVAL_YEARLY),
         },
     }
-
 
 def _sub_payload(sub: OrganizationSubscription, org_id):
     used = seats_used(org_id)
@@ -144,6 +146,52 @@ def list_plans(request):
     return success({"plans": [_plan_payload(p) for p in plans]})
 
 
+@api_view(["POST"])
+@permission_classes([CookieAuthenticated, HasBillingAccess])
+def sync_dodo_product(request, key):
+    interval = _parse_interval(request.data.get("billing_interval"))
+
+    plan = BillingPlan.objects.filter(
+        key=key,
+        is_active=True,
+    ).first()
+
+    if not plan:
+        return error("Unknown plan", http_status=400)
+
+    if not plan.is_paid:
+        return error(
+            "Free plans do not have Dodo products",
+            http_status=400,
+        )
+
+    try:
+        ensure_synced_plan_product(plan.id, interval)
+    except ValueError as exc:
+        return error(str(exc), http_status=400)
+    except Exception:
+        logger.exception("Dodo product synchronization failed")
+        return error(
+            "Dodo product synchronization failed",
+            http_status=502,
+        )
+
+    plan.refresh_from_db()
+
+    return success(
+        {
+            "key": plan.key,
+            "checkout_ready": plan.is_checkout_ready_for_interval(interval),
+            "synced_at": (
+                plan.dodo_synced_at.isoformat()
+                if plan.dodo_synced_at
+                else None
+            ),
+            "sync_error": plan.dodo_sync_error,
+        }
+    )
+
+
 @api_view(["GET"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
 def get_subscription(request):
@@ -166,12 +214,8 @@ def create_checkout(request):
     plan = BillingPlan.objects.filter(key=plan_key, is_active=True).first()
     if not plan or not plan.is_paid:
         return error("Unknown plan", http_status=400)
-    if not plan.is_checkout_ready_for_interval(interval):
+    if plan.price_for_interval(interval) <= 0:
         return error(f"{plan.name} {interval} billing is not available yet", http_status=400)
-
-    seat_addon_id = plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT
-    if extra_seats and not seat_addon_id:
-        return error("Extra seats are not available right now", http_status=400)
 
     sub = get_or_create_subscription(org_id)
     if sub.dodo_subscription_id and sub.status in (STATUS_ACTIVE, STATUS_ON_HOLD):
@@ -185,8 +229,10 @@ def create_checkout(request):
     customer_email = (profile.billing_email if profile else "") or user.email
     customer_name = (profile.billing_name if profile else "") or user.full_name
     try:
+        product_id = dodo.ensure_plan_product(plan, interval)
+        seat_addon_id = dodo.ensure_seat_addon(plan, interval) if extra_seats else ""
         session = dodo.create_checkout_session(
-            product_id=plan.dodo_product_id_for_interval(interval),
+            product_id=product_id,
             extra_seats=extra_seats,
             seat_addon_id=seat_addon_id,
             customer_email=customer_email,
@@ -227,18 +273,20 @@ def change_plan(request):
         return error("No active subscription. Start checkout first.", http_status=409)
     if sub.cancel_at_period_end:
         return error("This subscription is scheduled to cancel and cannot be changed.", http_status=409)
-    if not plan.is_checkout_ready_for_interval(interval):
+    if plan.price_for_interval(interval) <= 0:
         return error(f"{plan.name} {interval} billing is not available yet", http_status=400)
     problems = _plan_change_blockers(org_id, plan, extra_seats)
     if problems:
         return error(f"Cannot switch to {plan.name}: " + "; ".join(problems), http_status=409)
 
     try:
+        product_id = dodo.ensure_plan_product(plan, interval)
+        seat_addon_id = dodo.ensure_seat_addon(plan, interval) if extra_seats else ""
         dodo.change_plan(
             subscription_id=sub.dodo_subscription_id,
-            product_id=plan.dodo_product_id_for_interval(interval),
+            product_id=product_id,
             extra_seats=extra_seats,
-            seat_addon_id=plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT,
+            seat_addon_id=seat_addon_id,
             proration_billing_mode="prorated_immediately",
         )
     except DodoNotConfigured as exc:
@@ -258,6 +306,8 @@ def change_plan(request):
         "extra_seats": extra_seats,
     }
     return success(payload)
+
+
 @api_view(["POST"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
 def cancel_subscription(request):
@@ -301,11 +351,13 @@ def update_seats(request):
         )
 
     try:
+        product_id = dodo.ensure_plan_product(sub.plan, sub.billing_interval)
+        seat_addon_id = dodo.ensure_seat_addon(sub.plan, sub.billing_interval) if extra_seats else ""
         dodo.change_plan(
             subscription_id=sub.dodo_subscription_id,
-            product_id=sub.plan.dodo_product_id_for_interval(sub.billing_interval),
+            product_id=product_id,
             extra_seats=extra_seats,
-            seat_addon_id=sub.plan.dodo_seat_addon_id or settings.DODO_ADDON_SEAT,
+            seat_addon_id=seat_addon_id,
         )
     except DodoNotConfigured as exc:
         return error(str(exc), http_status=503)

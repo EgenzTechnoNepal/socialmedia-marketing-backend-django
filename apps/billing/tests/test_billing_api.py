@@ -14,6 +14,7 @@ from uuid import uuid4
 from apps.common.schema import apply_product_schema
 from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import Resolver404, resolve
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Organization
@@ -135,12 +136,117 @@ class PlansApiTests(BillingTestBase):
         self.assertTrue(pro["checkout_ready"]["monthly"])
         self.assertFalse(plans["free"]["checkout_ready"]["monthly"])
 
+    def test_checkout_ready_requires_a_dodo_product_id(self):
+        self.pro.dodo_price_id_monthly = ""
+        self.pro.save(update_fields=["dodo_price_id_monthly"])
+
+        response = self.client.get(f"{BASE}/plans")
+        plans = {p["key"]: p for p in response.data["data"]["plans"]}
+        self.assertFalse(plans["pro"]["checkout_ready"]["monthly"])
+        self.assertTrue(plans["pro"]["checkout_ready"]["yearly"])
+
     def test_plans_never_leak_dodo_ids(self):
         response = self.client.get(f"{BASE}/plans")
         body = json.dumps(response.data)
         for secret in ("pdt_pro_m", "pdt_pro_y", "pdt_biz_m", "pdt_biz_y"):
             self.assertNotIn(secret, body)
 
+
+class DodoSyncApiTests(BillingTestBase):
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_paid_plan_sync_returns_frozen_contract(self, mocked):
+        mocked.return_value = "pdt_pro_m"
+
+        self.pro.dodo_synced_at = timezone.now()
+        self.pro.dodo_sync_error = ""
+        self.pro.save(update_fields=["dodo_synced_at", "dodo_sync_error"])
+
+        response = self.client.post(
+            f"{BASE}/plans/pro/sync-dodo",
+            {
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        data = response.data["data"]
+
+        self.assertEqual(
+            set(data.keys()),
+            {"key", "checkout_ready", "synced_at", "sync_error"},
+        )
+        self.assertEqual(data["key"], "pro")
+        self.assertTrue(data["checkout_ready"])
+        self.assertIsNotNone(data["synced_at"])
+        self.assertEqual(data["sync_error"], "")
+
+        self.assertNotIn("product_id", data)
+        self.assertNotIn("sync_status", data)
+        self.assertNotIn("sync_key", data)
+
+        mocked.assert_called_once_with(
+            self.pro.id,
+            "monthly",
+        )
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_free_plan_never_calls_sync(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/free/sync-dodo",
+            {
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_unknown_plan_is_rejected(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/does-not-exist/sync-dodo",
+            {
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_invalid_interval_is_rejected(self, mocked):
+        response = self.client.post(
+            f"{BASE}/plans/pro/sync-dodo",
+            {
+                "billing_interval": "weekly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    @patch("apps.billing.views.ensure_synced_plan_product")
+    def test_sync_failure_returns_502(self, mocked):
+        mocked.side_effect = RuntimeError("Dodo unavailable")
+
+        response = self.client.post(
+            f"{BASE}/plans/pro/sync-dodo",
+            {
+                "billing_interval": "monthly",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn(
+            "Dodo unavailable",
+            json.dumps(response.data),
+        )
 
 class SubscriptionAndUsageApiTests(BillingTestBase):
     def test_new_org_starts_on_free(self):
@@ -220,6 +326,7 @@ class CheckoutApiTests(BillingTestBase):
     @patch("apps.billing.services.dodo.create_checkout_session")
     def test_checkout_blocked_when_interval_not_configured(self, mocked):
         self.pro.dodo_price_id_yearly = ""
+        self.pro.price_yearly = 0
         self.pro.save()
         response = self.client.post(
             f"{BASE}/checkout",
