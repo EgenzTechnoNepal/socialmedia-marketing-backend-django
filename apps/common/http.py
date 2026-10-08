@@ -104,6 +104,27 @@ def parse_date_range(from_str: str, to_str: str):
     return start, end, ""
 
 
+def parse_optional_date_range(start_str: str = "", end_str: str = ""):
+    """Parse optional inclusive YYYY-MM-DD bounds as UTC datetimes."""
+    from datetime import datetime, time as dtime
+
+    start = end = None
+    if start_str:
+        try:
+            start = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None, None, "Invalid start_date. Use YYYY-MM-DD"
+    if end_str:
+        try:
+            end_day = datetime.strptime(end_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None, None, "Invalid end_date. Use YYYY-MM-DD"
+        end = datetime.combine(end_day, dtime(23, 59, 59, 999999), tzinfo=timezone.utc)
+    if start and end and end < start:
+        return None, None, "end_date must be on or after start_date"
+    return start, end, ""
+
+
 def period_bounds(request):
     """from/to query params, or current month through now."""
     now = datetime.now(timezone.utc)

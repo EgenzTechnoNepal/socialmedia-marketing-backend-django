@@ -7,16 +7,19 @@ Run with:        python manage.py test apps.billing.tests.test_billing_api
 Dodo is never called for real: every Dodo function is patched.
 """
 
+import hashlib
 import json
+from datetime import datetime, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
 from apps.common.schema import apply_product_schema
 from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import Resolver404, resolve
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.test import APIClient
 
-from apps.accounts.models import Organization
+from apps.accounts.models import APIKey, Organization, User
 from apps.billing.models import (
     DEFAULT_FEATURES,
     DEFAULT_QUOTAS,
@@ -117,6 +120,143 @@ class BillingTestBase(TestCase):
             dodo_subscription_id="sub_1",
             **extra,
         )
+
+
+class InvoiceListFilterTests(BillingTestBase):
+    @patch("apps.billing.views.dodo.list_payments")
+    def test_invoice_date_filters_are_inclusive_and_paginated(self, list_payments):
+        self.make_paid_sub()
+        list_payments.return_value = [
+            {"id": "old", "created_at": "2025-12-31T23:59:59Z", "status": "succeeded"},
+            {"id": "first", "created_at": "2026-01-01T00:00:00Z", "status": "succeeded"},
+            {"id": "second", "created_at": "2026-01-02T12:00:00Z", "status": "succeeded"},
+            {"id": "new", "created_at": "2026-01-03T00:00:00Z", "status": "succeeded"},
+        ]
+
+        response = self.client.get(
+            f"{BASE}/invoices",
+            {"start_date": "2026-01-01", "end_date": "2026-01-02", "page": 2, "limit": 1},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(data["page"], 2)
+        self.assertEqual([item["id"] for item in data["invoices"]], ["second"])
+
+    @patch("apps.billing.views.dodo.list_payments")
+    def test_invoice_start_date_only(self, list_payments):
+        self.make_paid_sub()
+        list_payments.return_value = [
+            {"id": "before", "created_at": "2026-01-01T23:59:59Z", "status": "succeeded"},
+            {"id": "on_start", "created_at": "2026-01-02T00:00:00Z", "status": "succeeded"},
+            {"id": "after", "created_at": "2026-01-03T00:00:00Z", "status": "succeeded"},
+        ]
+
+        response = self.client.get(f"{BASE}/invoices", {"start_date": "2026-01-02"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.data["data"]["invoices"]], ["on_start", "after"])
+
+    @patch("apps.billing.views.dodo.list_payments")
+    def test_invoice_end_date_only(self, list_payments):
+        self.make_paid_sub()
+        list_payments.return_value = [
+            {"id": "before", "created_at": "2026-01-01T23:59:59Z", "status": "succeeded"},
+            {"id": "on_end", "created_at": "2026-01-02T23:59:59Z", "status": "succeeded"},
+            {"id": "after", "created_at": "2026-01-03T00:00:00Z", "status": "succeeded"},
+        ]
+
+        response = self.client.get(f"{BASE}/invoices", {"end_date": "2026-01-02"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.data["data"]["invoices"]], ["before", "on_end"])
+
+    def test_invalid_invoice_date_is_rejected_without_customer(self):
+        response = self.client.get(f"{BASE}/invoices", {"start_date": "2026-02-30"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid start_date", response.data["message"])
+
+
+class SettingsFilterApiTests(BillingTestBase):
+    def setUp(self):
+        super().setUp()
+        self.pro.features = {**(self.pro.features or {}), "api_keys": True}
+        self.pro.save(update_fields=["features", "updated_at"])
+        self.make_paid_sub()
+        self.key_user = User.objects.create(
+            organization=self.org,
+            email=f"api-key-test-{uuid4().hex}@example.com",
+            password_hash="unused-test-hash",
+            full_name="API Key Test",
+            settings={},
+            is_active=True,
+            is_available=True,
+            is_super_admin=False,
+        )
+
+    def make_key(self, name, *, active=True, created_at=None, raw=None):
+        raw = raw or f"whm_{uuid4().hex}"
+        key = APIKey.objects.create(
+            organization_id=self.org.id,
+            user=self.key_user,
+            name=name,
+            key_prefix=raw[4:20],
+            key_hash=hashlib.sha256(raw.encode()).hexdigest(),
+            is_active=active,
+        )
+        if created_at:
+            APIKey.objects.filter(id=key.id).update(created_at=created_at)
+        return key, raw
+
+    def test_api_key_date_status_filters_and_pagination(self):
+        first, _ = self.make_key("first", created_at=datetime(2026, 1, 5, tzinfo=timezone.utc))
+        second, _ = self.make_key("second", created_at=datetime(2026, 1, 10, tzinfo=timezone.utc))
+        self.make_key("inactive", active=False, created_at=datetime(2026, 1, 12, tzinfo=timezone.utc))
+        self.make_key("outside", created_at=datetime(2026, 2, 1, tzinfo=timezone.utc))
+
+        response = self.client.get(
+            "/api/api-keys",
+            {"start_date": "2026-01-01", "end_date": "2026-01-31", "status": "Active", "page": 2, "limit": 1},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(data["page"], 2)
+        self.assertEqual([row["id"] for row in data["api_keys"]], [str(first.id)])
+        self.assertEqual(data["api_keys"][0]["status"], "Active")
+        self.assertTrue(second.is_active)
+
+    def test_api_key_status_change_is_persisted_and_inactive_key_rejected(self):
+        key, raw = self.make_key("status test")
+
+        response = self.client.put(
+            f"/api/api-keys/{key.id}",
+            {"status": "Inactive"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["status"], "Inactive")
+        key.refresh_from_db()
+        self.assertFalse(key.is_active)
+
+        from apps.common.authentication import APIKeyAuthentication
+        from rest_framework.test import APIRequestFactory
+
+        request = APIRequestFactory().get("/api/me", HTTP_X_API_KEY=raw)
+        with self.assertRaises(AuthenticationFailed) as raised:
+            APIKeyAuthentication().authenticate(request)
+        self.assertIn("Invalid API key", str(raised.exception))
+
+    def test_archive_placeholder_reports_coming_soon(self):
+        response = self.client.get("/api/archive")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["data"]["available"])
+        self.assertEqual(response.data["data"]["status"], "coming_soon")
 
 
 class PlansApiTests(BillingTestBase):
