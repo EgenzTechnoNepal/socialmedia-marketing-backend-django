@@ -1,4 +1,6 @@
 from __future__ import annotations
+from datetime import datetime, timezone
+
 from django.utils import timezone as dj_tz
 import logging
 
@@ -16,6 +18,7 @@ from apps.common.permissions import (
     HasBillingAccess,
     request_organization_id,
 )
+from apps.common.http import list_payload, parse_optional_date_range, parse_pagination
 from .entitlements import (
     METER_AI_COMPLETION,
     METER_CAMPAIGN_RECIPIENT,
@@ -384,18 +387,49 @@ def usage(request):
 @api_view(["GET"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])
 def invoices(request):
+    start_date, end_date, date_error = parse_optional_date_range(
+        request.query_params.get("start_date") or "",
+        request.query_params.get("end_date") or "",
+    )
+    if date_error:
+        return error(date_error, http_status=400)
+
+    page, limit, offset = parse_pagination(request)
     org_id = _org(request)
     sub = get_or_create_subscription(org_id)
     if not sub.dodo_customer_id:
-        return success({"invoices": []})
+        return success(list_payload("invoices", [], 0, page, limit))
     try:
-        items = dodo.list_payments(sub.dodo_customer_id)
+        # Fetch every provider page so filtered totals and local pagination
+        # describe the customer's complete invoice history.
+        items = dodo.list_payments(sub.dodo_customer_id, limit=None)
     except DodoNotConfigured:
-        return success({"invoices": []})
+        return success(list_payload("invoices", [], 0, page, limit))
     except Exception:
         logger.exception("Dodo invoices failed")
         return error("Failed to load invoices", http_status=502)
+    filtered_items = []
     for item in items:
+        invoice_date = item.get("created_at")
+        if start_date or end_date:
+            try:
+                if isinstance(invoice_date, datetime):
+                    parsed_date = invoice_date
+                else:
+                    parsed_date = datetime.fromisoformat(str(invoice_date).replace("Z", "+00:00"))
+                if parsed_date.tzinfo is None:
+                    parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+                parsed_date = parsed_date.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                logger.warning("Skipping invoice with invalid created_at: %r", invoice_date)
+                continue
+            if start_date and parsed_date < start_date:
+                continue
+            if end_date and parsed_date > end_date:
+                continue
+        filtered_items.append(item)
+
+    for item in filtered_items:
         # invoice_pdf only serves successful payments (see its 400 guard below),
         # so don't hand the frontend a link that will 400 if it's clicked.
         item["invoice_url"] = (
@@ -404,7 +438,15 @@ def invoices(request):
             else None
         )
 
-    return success({"invoices": items})
+    return success(
+        list_payload(
+            "invoices",
+            filtered_items[offset : offset + limit],
+            len(filtered_items),
+            page,
+            limit,
+        )
+    )
 
 @api_view(["GET"])
 @permission_classes([CookieAuthenticated, HasBillingAccess])

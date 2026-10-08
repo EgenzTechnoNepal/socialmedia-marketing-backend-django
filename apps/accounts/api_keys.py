@@ -7,7 +7,7 @@ from rest_framework.decorators import api_view, permission_classes
 from apps.accounts.models import APIKey
 from apps.billing.entitlements import FEATURE_API_KEYS, assert_feature
 from apps.common.envelope import error, success
-from apps.common.http import iso, org_id, parse_pagination, require_perm
+from apps.common.http import iso, org_id, parse_optional_date_range, parse_pagination, require_perm
 from apps.common.permissions import CookieAuthenticated
 
 
@@ -19,6 +19,7 @@ def _key_payload(key: APIKey, *, include_secret=None):
         "last_used_at": iso(key.last_used_at),
         "expires_at": iso(key.expires_at),
         "is_active": key.is_active,
+        "status": "Active" if key.is_active else "Inactive",
         "created_at": iso(key.created_at),
     }
     if include_secret:
@@ -38,6 +39,21 @@ def api_keys_collection(request):
         search = (request.query_params.get("search") or "").strip()
         if search:
             qs = qs.filter(name__icontains=search)
+        start_date, end_date, date_error = parse_optional_date_range(
+            request.query_params.get("start_date") or "",
+            request.query_params.get("end_date") or "",
+        )
+        if date_error:
+            return error(date_error, http_status=400)
+        if start_date:
+            qs = qs.filter(created_at__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__lte=end_date)
+        status = (request.query_params.get("status") or "").strip().lower()
+        if status not in ("", "active", "inactive"):
+            return error("Invalid status. Use Active or Inactive", http_status=400)
+        if status:
+            qs = qs.filter(is_active=status == "active")
         total = qs.count()
         items = [_key_payload(k) for k in qs.order_by("-created_at")[offset : offset + limit]]
         return success({"api_keys": items, "total": total, "page": page, "limit": limit})
@@ -84,7 +100,16 @@ def api_key_detail(request, key_id):
         return success({"message": "API key deleted"})
     require_perm(request, "api_keys", "write")
     data = request.data if isinstance(request.data, dict) else {}
-    if "is_active" in data:
-        key.is_active = bool(data["is_active"])
+    if "status" in data:
+        status = str(data["status"]).strip().lower()
+        if status not in ("active", "inactive"):
+            return error("Invalid status. Use Active or Inactive", http_status=400)
+        key.is_active = status == "active"
+        key.save(update_fields=["is_active", "updated_at"])
+    elif "is_active" in data:
+        is_active = data["is_active"]
+        if not isinstance(is_active, bool):
+            return error("is_active must be a boolean", http_status=400)
+        key.is_active = is_active
         key.save(update_fields=["is_active", "updated_at"])
     return success(_key_payload(key))
