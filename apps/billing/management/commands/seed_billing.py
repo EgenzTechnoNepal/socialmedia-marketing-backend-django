@@ -80,6 +80,7 @@ class Command(BaseCommand):
     def _seed_plans(self):
         addon = settings.DODO_ADDON_SEAT
         for spec in PLANS:
+            existing = BillingPlan.objects.filter(key=spec["key"]).first()
             product_id = getattr(settings, spec["product_env"], "") if spec["product_env"] else ""
             price_id_monthly = (
                 getattr(settings, spec["price_monthly_env"], "")
@@ -101,10 +102,13 @@ class Command(BaseCommand):
                     "currency": spec["currency"],
                     "price_monthly": spec["price_monthly"],
                     "price_yearly": spec["price_yearly"],
-                    "dodo_product_id": product_id or "",
-                    "dodo_price_id_monthly": price_id_monthly or "",
-                    "dodo_price_id_yearly": price_id_yearly or "",
-                    "dodo_seat_addon_id": addon if spec["key"] != PLAN_FREE else "",
+                    "dodo_product_id": product_id or (existing.dodo_product_id if existing else ""),
+                    "dodo_price_id_monthly": price_id_monthly or (existing.dodo_price_id_monthly if existing else ""),
+                    "dodo_price_id_yearly": price_id_yearly or (existing.dodo_price_id_yearly if existing else ""),
+                    "dodo_seat_addon_id": (
+                        addon or (existing.dodo_seat_addon_id if existing else "")
+                        if spec["key"] != PLAN_FREE else ""
+                    ),
                     "is_active": True,
                     "extra_seat_price_monthly": spec["extra_seat_price_monthly"],
                     "extra_seat_price_yearly": spec["extra_seat_price_yearly"],
@@ -114,9 +118,9 @@ class Command(BaseCommand):
             self.stdout.write(f"  plan {plan.key} ({'created' if created else 'updated'})")
             if plan.is_paid:
                 for interval in ("monthly", "yearly"):
-                    if not plan.is_checkout_ready_for_interval(interval):
+                    if plan.price_for_interval(interval) <= 0:
                         self.stdout.write(self.style.WARNING(
-                            f"    ! {plan.key}: Dodo IDs missing for {interval}, checkout disabled for {interval}"
+                            f"    ! {plan.key}: {interval} price is zero, checkout unavailable for {interval}"
                         ))
     def _seed_subscriptions(self):
         free = BillingPlan.objects.get(key=PLAN_FREE)

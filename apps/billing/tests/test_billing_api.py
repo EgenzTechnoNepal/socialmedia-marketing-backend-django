@@ -135,6 +135,15 @@ class PlansApiTests(BillingTestBase):
         self.assertTrue(pro["checkout_ready"]["monthly"])
         self.assertFalse(plans["free"]["checkout_ready"]["monthly"])
 
+    def test_checkout_ready_requires_a_dodo_product_id(self):
+        self.pro.dodo_price_id_monthly = ""
+        self.pro.save(update_fields=["dodo_price_id_monthly"])
+
+        response = self.client.get(f"{BASE}/plans")
+        plans = {p["key"]: p for p in response.data["data"]["plans"]}
+        self.assertFalse(plans["pro"]["checkout_ready"]["monthly"])
+        self.assertTrue(plans["pro"]["checkout_ready"]["yearly"])
+
     def test_plans_never_leak_dodo_ids(self):
         response = self.client.get(f"{BASE}/plans")
         body = json.dumps(response.data)
@@ -220,6 +229,7 @@ class CheckoutApiTests(BillingTestBase):
     @patch("apps.billing.services.dodo.create_checkout_session")
     def test_checkout_blocked_when_interval_not_configured(self, mocked):
         self.pro.dodo_price_id_yearly = ""
+        self.pro.price_yearly = 0
         self.pro.save()
         response = self.client.post(
             f"{BASE}/checkout",

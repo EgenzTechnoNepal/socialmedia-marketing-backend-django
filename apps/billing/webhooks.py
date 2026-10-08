@@ -178,8 +178,14 @@ def _plan_for_product(product_id: str) -> tuple[BillingPlan | None, str | None]:
 def _extra_seats(data: dict, plan: BillingPlan | None = None) -> int:
     addons = data.get("addons") or data.get("add_ons") or []
     seat_ids = {settings.DODO_ADDON_SEAT}
-    if plan and plan.dodo_seat_addon_id:
-        seat_ids.add(plan.dodo_seat_addon_id)
+    if plan:
+        seat_ids.update(
+            {
+                plan.dodo_seat_addon_id,
+                plan.dodo_seat_addon_id_monthly,
+                plan.dodo_seat_addon_id_yearly,
+            }
+        )
     seat_ids.discard("")
     if not seat_ids:
         return 0
